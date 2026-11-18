@@ -1,0 +1,13 @@
+# archives / scratch files
+*.tar.gz
+*.log
+
+# generated help tags
+doc/tags
+
+# test scratch space
+tests/.tmp/
+
+# editors
+.idea/
+.vscode/

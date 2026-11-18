@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+
+      - name: Unit tests (pure functions)
+        run: nvim --headless -l tests/run.lua
+
+      - name: Load-check every lua module
+        run: |
+          nvim --headless -l tests/loadcheck.lua
+
+      - name: Formatting (advisory)
+        continue-on-error: true
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          version: latest

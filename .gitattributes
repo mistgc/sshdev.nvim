@@ -1,0 +1,3 @@
+# sshdev.nvim is a cross-platform (Linux/macOS/Windows) Neovim plugin:
+# normalize everything to LF in the repository.
+* text=auto eol=lf
