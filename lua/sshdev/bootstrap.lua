@@ -37,7 +37,6 @@ set -eu
 ROOT='{{ROOT}}'
 URL='{{URL}}'
 PROXY='{{PROXY}}'
-EXTRA_ENV='{{EXTRA_ENV}}'
 BIN_DIR='{{BIN_DIR}}'
 
 if [ -x "$BIN_DIR/bin/nvim" ]; then
@@ -50,34 +49,43 @@ command -v curl >/dev/null 2>&1 || { printf 'SSHDEV:ERROR=curl-missing\n'; exit 
 command -v tar  >/dev/null 2>&1 || { printf 'SSHDEV:ERROR=tar-missing\n';  exit 1; }
 
 printf 'SSHDEV:PHASE=download\n'
-rm -rf "$BIN_DIR"
-mkdir -p "$BIN_DIR"
-TMP="$BIN_DIR.tmp.$$"
+TMP="$ROOT/.nvim-download.$$"
 rm -rf "$TMP"
 mkdir -p "$TMP"
-if [ -n "$EXTRA_ENV" ]; then
-  eval "export $EXTRA_ENV"
-fi
+
+# --silent --show-error: no progress bar flooding the ssh stderr stream.
 if [ -n "$PROXY" ]; then
   http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY" \
-    curl --fail --location --retry 3 --connect-timeout 20 -o "$TMP/nvim.tar.gz" "$URL"
+    curl --fail --location --silent --show-error --retry 3 \
+      --connect-timeout 20 --max-time 900 -o "$TMP/nvim.tar.gz" "$URL"
 else
-  curl --fail --location --retry 3 --connect-timeout 20 -o "$TMP/nvim.tar.gz" "$URL"
+  curl --fail --location --silent --show-error --retry 3 \
+    --connect-timeout 20 --max-time 900 -o "$TMP/nvim.tar.gz" "$URL"
 fi
+
 tar -xzf "$TMP/nvim.tar.gz" -C "$TMP"
 rm -f "$TMP/nvim.tar.gz"
+
 N=0
 TOP=''
 for f in "$TMP"/*; do
   N=$(( N + 1 ))
   TOP="$f"
 done
+# The tarball normally has one top-level dir (nvim-linux-x86_64/).
+# BIN_DIR must NOT exist at this point: `mv dir existing-dir` would move
+# the tree INSIDE it, leaving bin/nvim one level too deep.
 if [ "$N" -eq 1 ] && [ -d "$TOP" ]; then
+  rm -rf "$BIN_DIR"
+  mkdir -p "$(dirname "$BIN_DIR")"
   mv "$TOP" "$BIN_DIR"
   rm -rf "$TMP"
 else
+  rm -rf "$BIN_DIR"
+  mkdir -p "$(dirname "$BIN_DIR")"
   mv "$TMP" "$BIN_DIR"
 fi
+
 if [ ! -x "$BIN_DIR/bin/nvim" ]; then
   printf 'SSHDEV:ERROR=bad-archive\n'
   rm -rf "$BIN_DIR"
@@ -90,7 +98,10 @@ printf 'SSHDEV:BINVERSION=%s\n' "$("$BIN_DIR/bin/nvim" -v | head -n 1)"
 local PREPARE_WS_SCRIPT = [[
 set -eu
 WS_DIR='{{WS_DIR}}'
+CWD='{{CWD}}'
 mkdir -p "$WS_DIR"
+# the designated remote workspace folder may not exist yet
+mkdir -p "$CWD"
 rm -rf "$WS_DIR/nvim-config"
 printf 'SSHDEV:WS_DIR=%s\n' "$WS_DIR"
 ]]
@@ -362,20 +373,10 @@ function M.ensure_binary(cfg, parsed, ctx)
   local bin_dir = Util.join_remote(ctx.root, '_bin', version .. '-' .. asset)
   local url = ('%s/%s/%s.tar.gz'):format(cfg.download_mirror, version, asset)
 
-  local extra_env = {}
-  if cfg.proxy then
-    table.insert(extra_env, ('http_proxy=%s'):format(cfg.proxy))
-    table.insert(extra_env, ('https_proxy=%s'):format(cfg.proxy))
-    table.insert(extra_env, ('all_proxy=%s'):format(cfg.proxy))
-  end
-  -- install_commands are NOT part of the env; join env pairs for `eval`.
-  local extra_env_str = table.concat(extra_env, ' ')
-
   local script = Util.render(ENSURE_NVIM_SCRIPT, {
     ROOT = Util.shsafe(ctx.root, 'remote root'),
     URL = Util.shsafe(url, 'download url'),
     PROXY = cfg.proxy and Util.shsafe(cfg.proxy, 'proxy') or '',
-    EXTRA_ENV = Util.shsafe(extra_env_str, 'proxy env'),
     BIN_DIR = Util.shsafe(bin_dir, 'nvim install dir'),
   })
 
@@ -397,7 +398,7 @@ function M.ensure_binary(cfg, parsed, ctx)
     return nil, ('downloading nvim %s on the remote failed (exit %s):\n%s'):format(
       version,
       res.code,
-      Util.log_tail(res.stderr .. res.stdout, 10)
+      Util.tail(res.stderr .. res.stdout, 10)
     )
   end
   return { bin = kv.BIN, version_line = kv.BINVERSION or '?' }
@@ -413,7 +414,7 @@ function M.upload_shim(cfg, parsed, ctx)
   local target = Util.join_remote(ctx.ws_dir, 'shim.lua')
   local res = Ssh.upload_file(cfg, parsed, cwd, 'remote_shim.lua', target, cfg.timeouts.ssh)
   if res.code ~= 0 then
-    return nil, ('uploading the remote shim failed (exit %s):\n%s'):format(res.code, Util.log_tail(res.stderr, 10))
+    return nil, ('uploading the remote shim failed (exit %s):\n%s'):format(res.code, Util.tail(res.stderr, 10))
   end
   return true
 end
@@ -424,10 +425,11 @@ function M.upload_config(cfg, parsed, ctx)
   -- mkdir + wipe previous nvim-config
   local prep = Util.render(PREPARE_WS_SCRIPT, {
     WS_DIR = Util.shsafe(ctx.ws_dir, 'workspace dir'),
+    CWD = Util.shsafe(ctx.cwd, 'remote dir'),
   })
   local res = Ssh.run_script(cfg, parsed, prep, { timeout = cfg.timeouts.ssh, label = 'ssh' })
   if res.code ~= 0 then
-    return nil, ('preparing %s failed (exit %s):\n%s'):format(ctx.ws_dir, res.code, Util.log_tail(res.stderr, 10))
+    return nil, ('preparing %s failed (exit %s):\n%s'):format(ctx.ws_dir, res.code, Util.tail(res.stderr, 10))
   end
 
   -- stage locally, then scp the staged directory
@@ -437,7 +439,7 @@ function M.upload_config(cfg, parsed, ctx)
   end
   local up = Ssh.upload_dir(cfg, parsed, parent, 'nvim-config', ctx.ws_dir, cfg.timeouts.ssh)
   if up.code ~= 0 then
-    return nil, ('scp of your config failed (exit %s):\n%s'):format(up.code, Util.log_tail(up.stderr, 10))
+    return nil, ('scp of your config failed (exit %s):\n%s'):format(up.code, Util.tail(up.stderr, 10))
   end
   return true
 end
@@ -496,7 +498,7 @@ function M.start_server(cfg, parsed, ctx, rport)
   if res.code ~= 0 then
     return nil, ('starting the remote server failed (exit %s):\n%s'):format(
       res.code,
-      Util.log_tail(res.stdout .. res.stderr, 15)
+      Util.tail(res.stdout .. res.stderr, 15)
     )
   end
   local kv = Util.parse_keyvals(res.stdout)
@@ -507,9 +509,9 @@ function M.start_server(cfg, parsed, ctx, rport)
     return { running = true, addr = kv.ADDR, pid = kv.PID, fresh = true }
   end
   if kv.SERVER == 'dead' then
-    return nil, 'the remote nvim server died immediately after start:\n' .. Util.log_tail(res.stdout, 15)
+    return nil, 'the remote nvim server died immediately after start:\n' .. Util.tail(res.stdout, 15)
   end
-  return nil, 'unexpected response from the remote start script:\n' .. Util.log_tail(res.stdout, 15)
+  return nil, 'unexpected response from the remote start script:\n' .. Util.tail(res.stdout, 15)
 end
 
 ---Check whether the workspace's server is running.

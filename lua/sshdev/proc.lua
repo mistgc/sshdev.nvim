@@ -19,6 +19,23 @@ local function report_from_resume(co, ok, err)
   return ok
 end
 
+---Resume a flow coroutine from a libuv/job callback.
+---
+---Job and libuv callbacks run in a "fast event context", where nvim's own
+---APIs (jobstart, vim.cmd, ...) are forbidden (E5560). Since the resumed
+---continuation immediately does more work (next ssh/scp job, :connect, ...),
+---ALWAYS hop back to the main loop first.
+local function resume_soon(co, value)
+  vim.schedule(function()
+    -- a dead coroutine would make resume() error; ignore that case
+    if coroutine.status(co) ~= 'suspended' then
+      return
+    end
+    local ok, a = coroutine.resume(co, value)
+    report_from_resume(co, ok, a)
+  end)
+end
+
 --- Wait for a background job. Returns { code, stdout, stderr, timed_out }.
 ---
 --- opts:
@@ -42,14 +59,12 @@ function M.await(opts)
       return
     end
     done = true
-    local res = {
+    resume_soon(co, {
       code = code,
       stdout = table.concat(out, '\n'),
       stderr = table.concat(errout, '\n'),
       timed_out = timed_out,
-    }
-    local ok, a = coroutine.resume(co, res)
-    report_from_resume(co, ok, a)
+    })
   end
 
   local job_opts = {
@@ -103,6 +118,16 @@ function M.await(opts)
   return coroutine.yield()
 end
 
+---Sleep inside a flow (main-loop timer, safe context on resume).
+---@param ms integer
+function M.sleep(ms)
+  local co = assert(coroutine.running(), 'sshdev: sleep() must be called from a coroutine')
+  vim.defer_fn(function()
+    resume_soon(co, true)
+  end, ms)
+  return coroutine.yield()
+end
+
 --- Probe a TCP endpoint from inside a flow.
 --- Returns true when the connection could be established and stayed open
 --- for `settle_ms` (an ssh -L forward accepts locally then drops when the
@@ -131,8 +156,7 @@ function M.await_tcp_probe(host, port, settle_ms, timeout_ms)
       end)
       handle:close()
     end
-    local ok, a = coroutine.resume(co, v)
-    report_from_resume(co, ok, a)
+    resume_soon(co, v)
   end
 
   if timeout_ms then

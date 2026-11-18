@@ -173,6 +173,24 @@ T.describe('config validation: rejects', function()
   end
 end)
 
+T.describe('config attach strategy', function()
+  for _, v in ipairs({ 'auto', 'terminal', 'connect', 'command' }) do
+    local _, err = Config.setup({ attach = v })
+    eq(err, nil, ('attach=%s must be accepted'):format(v))
+  end
+  local _, err = Config.setup({ attach = 'bogus' })
+  ok(err ~= nil, 'invalid attach strategy rejected')
+  eq(Config.build({}).attach, 'auto')
+end)
+
+T.describe('session.ui_kind', function()
+  local Session = require('sshdev.session')
+  local kind = Session.ui_kind()
+  ok(vim.tbl_contains({ 'headless', 'tui', 'external' }, kind), 'ui_kind returns a known kind')
+  -- tests run with --headless, so there is no UI
+  eq(kind, 'headless')
+end)
+
 T.describe('config.get falls back to defaults', function()
   local cfg = Config.get()
   eq(cfg.remote_root, '~/.sshdev.nvim')
@@ -238,7 +256,6 @@ T.describe('bootstrap templates render completely', function()
     ROOT = ctx.root,
     URL = ('%s/%s/%s.tar.gz'):format(cfg.download_mirror, ctx.version, ctx.asset),
     PROXY = cfg.proxy,
-    EXTRA_ENV = ('http_proxy=%s https_proxy=%s all_proxy=%s'):format(cfg.proxy, cfg.proxy, cfg.proxy),
     BIN_DIR = ('%s/_bin/%s-%s'):format(ctx.root, ctx.version, ctx.asset),
   })
 
@@ -268,7 +285,7 @@ T.describe('bootstrap templates render completely', function()
   local rendered = {
     probe = Bootstrap._script_templates.probe,
     ensure = ensure,
-    prepare = Util.render(Bootstrap._script_templates.prepare, { WS_DIR = ws_dir }),
+    prepare = Util.render(Bootstrap._script_templates.prepare, { WS_DIR = ws_dir, CWD = ctx.cwd }),
     install = install,
     start = start,
     status = Util.render(Bootstrap._script_templates.status, { WS_DIR = ws_dir }),
@@ -279,7 +296,9 @@ T.describe('bootstrap templates render completely', function()
   end
 
   -- spot-check content the flows depend on (plain finds, no patterns)
-  ok(ensure:find('http_proxy=http://127.0.0.1:7890', 1, true) ~= nil, 'proxy env present')
+  ok(ensure:find([[http_proxy="$PROXY"]], 1, true) ~= nil, 'proxy env applied to curl')
+  ok(ensure:find("PROXY='http://127.0.0.1:7890'", 1, true) ~= nil, 'proxy value interpolated')
+  ok(ensure:find('--silent --show-error', 1, true) ~= nil, 'curl progress suppressed')
   ok(install:find("'Lazy! restore'", 1, true) ~= nil, 'install command quoted')
   ok(install:find('NVIM_APPNAME=nvim-config', 1, true) ~= nil, 'appname isolated')
   ok(start:find('--headless --listen 127.0.0.1:"$RPORT"', 1, true) ~= nil, 'server listens')

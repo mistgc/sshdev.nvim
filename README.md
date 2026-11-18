@@ -106,12 +106,36 @@ Inside an attached session, on the remote:
   state stay isolated between projects.
 - The remote server listens on `127.0.0.1:<port>` (only reachable through
   the tunnel). The local port is deterministic per (destination, workspace).
-- `:connect` stops your local nvim server (per upstream semantics — a UI
-  cannot serve and attach at once) and your UI becomes a client of the
-  remote one. That is why the tunnel job is detached from nvim: it must
-  survive the attach.
-- The tunnel runs with `ControlMaster=no` so it cannot be torn down by
+- The tunnel job is detached from nvim and runs with `ControlMaster=no`, so
+  it survives the local server stopping and cannot be torn down by
   short-lived multiplexed ssh masters.
+
+### Attaching: `--remote-ui`, not just `:connect`
+
+`:connect` only re-attaches when the current **UI** implements the
+`"connect"` UI event. The builtin TUI does **not** — per `:help :connect`,
+"if the current UI hasn't implemented the connect UI event, this command is
+equivalent to :detach". On a terminal, `:connect` therefore drops you back
+to the shell instead of attaching.
+
+So sshdev.nvim attaches with the documented TUI mechanism, a separate UI
+client process over the tunnel:
+
+```sh
+nvim --server 127.0.0.1:<port> --remote-ui
+```
+
+`attach = 'auto'` picks the strategy per UI:
+
+| UI | strategy | what happens |
+| --- | --- | --- |
+| builtin TUI | `terminal` | opens a terminal tab running `nvim --server ... --remote-ui`, so the remote UI owns that tab; detaching closes the tab |
+| external GUI (nvim-qt, Neovide, …) | `connect` | uses `:connect tcp://…` (these UIs implement the connect event) |
+| headless | `command` | just prints the command to run |
+
+Override with `attach = 'terminal' | 'connect' | 'command'`. The remote
+server is the same in all cases, and `:q` on it is still hijacked into
+`:detach`.
 
 ## Configuration
 
@@ -134,6 +158,7 @@ require('sshdev').setup({
   install_commands = { 'Lazy! restore' }, -- extra headless ex-commands
   excludes = { '.git', '.github', 'lazy-lock.lua' },
   hijack_quit = true,        -- :q -> :detach on the remote (the default)
+  attach = 'auto',           -- "auto" | "terminal" | "connect" | "command"
 
   timeouts = { ssh = 60, download = 600, install = 900, attach = 30 },
 })

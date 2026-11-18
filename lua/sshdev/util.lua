@@ -296,14 +296,29 @@ end
 
 ---Release tag for the local nvim ("v0.11.3"), plus whether this is a
 ---dev/nightly build.
+---
+---Careful: on a RELEASE build `vim.version().build` holds the tag itself
+---("v0.12.6"), so a non-empty `build` does NOT mean "dev". Dev builds
+---report a prerelease and/or a build string like
+---"v0.12.0-dev-1234+g0123456".
 ---@return string tag
 ---@return boolean is_dev
 function M.nvim_version_tag()
   local v = vim.version()
   local tag = ('v%d.%d.%d'):format(v.major, v.minor, v.patch)
-  local dev = (v.prerelease and v.prerelease ~= '' and true)
-    or (v.build and v.build ~= '' and true)
-    or false
+  local dev = false
+  if v.api_prerelease == true then
+    dev = true
+  end
+  if v.prerelease ~= nil and tostring(v.prerelease) ~= '' then
+    dev = true
+  end
+  if v.build ~= nil and tostring(v.build) ~= '' then
+    local b = tostring(v.build)
+    if not b:match('^v?%d+%.%d+%.%d+$') then
+      dev = true
+    end
+  end
   return tag, dev
 end
 
@@ -358,6 +373,10 @@ end
 
 ---Append a line to the sshdev log buffer (and mirror into memory).
 ---Accepts format-string arguments.
+---
+---Safe to call from job/libuv callbacks (fast event context): the buffer
+---write is best-effort. Every line is also kept in memory, and :SSHdevLog
+---rebuilds the whole buffer from memory, so a skipped append is harmless.
 function M.log(msg, ...)
   if select('#', ...) > 0 then
     msg = msg:format(...)
@@ -367,12 +386,15 @@ function M.log(msg, ...)
   if #M._log_lines > 1000 then
     table.remove(M._log_lines, 1)
   end
-  local b = find_log_buf()
-  if b then
-    pcall(vim.api.nvim_buf_set_option, b, 'modifiable', true)
+  pcall(function()
+    local b = find_log_buf()
+    if not b then
+      return
+    end
+    vim.api.nvim_buf_set_option(b, 'modifiable', true)
     vim.api.nvim_buf_set_lines(b, -1, -1, false, { line })
-    pcall(vim.api.nvim_buf_set_option, b, 'modifiable', false)
-  end
+    vim.api.nvim_buf_set_option(b, 'modifiable', false)
+  end)
   return line
 end
 
@@ -388,8 +410,32 @@ function M.open_log()
 end
 
 ---User-facing notification with the [sshdev] prefix.
+---Schedules itself when called from a fast event context.
 function M.notify(msg, level)
-  vim.notify('[sshdev] ' .. msg, level or vim.log.levels.INFO)
+  local function show()
+    vim.notify('[sshdev] ' .. msg, level or vim.log.levels.INFO)
+  end
+  if vim.in_fast_event() then
+    vim.schedule(show)
+  else
+    show()
+  end
+end
+
+---Transient progress line (no history, no hit-enter prompt).
+---
+---Long-lived flows report progress through this instead of M.notify():
+---a history message that wraps forces a "Press ENTER" prompt and stalls
+---the UI in a terminal. Details still land in the :SSHdevLog buffer.
+function M.status(msg)
+  local function show()
+    pcall(vim.api.nvim_echo, { { '[sshdev] ' .. msg, 'None' } }, false, {})
+  end
+  if vim.in_fast_event() then
+    vim.schedule(show)
+  else
+    show()
+  end
 end
 
 ---Report an error from async context: log + notify.

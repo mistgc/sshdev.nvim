@@ -5,15 +5,17 @@ Author: mistgc and sshdev.nvim contributors     MIT licensed    *sshdev*
 ==============================================================================
 INTRODUCTION						*sshdev-intro*
 
-The local Neovim UI attaches to a remote `nvim --headless --listen` server
-through an SSH port forward: >
+The local Neovim UI is attached to a remote `nvim --headless --listen`
+server through an SSH port forward: >
 
 	local nvim UI  <->  ssh -N -L  <->  remote nvim --listen 127.0.0.1:<port>
 
-The attach uses the |:connect| command (Neovim >= 0.11), so editing happens
-entirely on the remote host while the interface, keymaps and plugins come
-from your uploaded config. On the remote server, sshdev.nvim hijacks the
-quit family into |:detach| so quitting locally never kills the server.
+Attaching uses a `nvim --server ... --remote-ui` UI client over the tunnel
+(for terminal users) or |:connect| (for GUI UIs that implement the
+"connect" UI event); see |sshdev-attach|. Editing happens entirely on the
+remote host while the interface, keymaps and plugins come from your
+uploaded config. On the remote server, sshdev.nvim hijacks the quit family
+into |:detach| so quitting locally never kills the server.
 
 What sshdev.nvim does for a workspace:
 
@@ -100,6 +102,7 @@ Setup with defaults (all keys optional): >
 	  install_commands = { 'Lazy! restore' },
 	  excludes = { '.git', '.github' },
 	  hijack_quit = true,
+	  attach = 'auto',             -- "auto" | "terminal" | "connect" | "command"
 	  timeouts = { ssh = 60, download = 600, install = 900, attach = 30 },
 	})
 
@@ -136,6 +139,31 @@ excludes ~
 
 hijack_quit ~
 	See |sshdev-hijack|.
+
+attach ~
+	How the local UI attaches to the remote server; see |sshdev-attach|.
+
+==============================================================================
+ATTACHING						*sshdev-attach*
+
+|:connect| only re-attaches when the current UI implements the "connect"
+UI event. The builtin TUI does not ("if the current UI hasn't implemented
+the connect UI event, this command is equivalent to |:detach|"), so from a
+terminal |:connect| would just detach. sshdev.nvim therefore starts a UI
+client process over the tunnel instead: >
+
+	nvim --server 127.0.0.1:<port> --remote-ui
+
+`attach` selects the strategy:
+
+	"auto"      (default) builtin TUI -> "terminal"; external GUI ->
+	            "connect"; headless -> "command"
+	"terminal"  open a terminal tab running the --remote-ui client
+	"connect"   use |:connect| tcp://127.0.0.1:<port>
+	"command"   do not attach; just report the command to run
+
+With "terminal", detaching (:q on the remote) closes the tab and returns
+to the local nvim; the remote server keeps running.
 
 ==============================================================================
 REMOTE LAYOUT						*sshdev-remote-layout*

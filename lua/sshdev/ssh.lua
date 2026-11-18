@@ -71,6 +71,11 @@ function M.run_script(cfg, parsed, script, opts)
 end
 
 ---scp one local file (relative to `cwd`) to an absolute remote path.
+---
+---The remote path is passed RAW (no shell quoting): OpenSSH >= 9 scp uses
+---the SFTP protocol by default, where the remote path never goes through a
+---remote shell, and literal quotes in it make Windows' scp fail with
+---"realpath ...: No such file / path canonicalization failed".
 ---Returns the await() result.
 ---@param cfg table
 ---@param parsed table
@@ -81,7 +86,7 @@ end
 ---@return table
 function M.upload_file(cfg, parsed, cwd, filename, remote_path, timeout_s)
   local args = base_args(cfg, parsed, cfg.scp_bin, 'scp')
-  vim.list_extend(args, { filename, parsed.dest .. ':' .. Util.shquote(remote_path) })
+  vim.list_extend(args, { filename, parsed.dest .. ':' .. remote_path })
   return Proc.await({
     cmd = args,
     cwd = cwd,
@@ -102,7 +107,7 @@ end
 ---@return table
 function M.upload_dir(cfg, parsed, cwd, dirname, remote_parent, timeout_s)
   local args = base_args(cfg, parsed, cfg.scp_bin, 'scp')
-  vim.list_extend(args, { '-C', '-r', dirname, parsed.dest .. ':' .. Util.shquote(remote_parent) })
+  vim.list_extend(args, { '-C', '-r', dirname, parsed.dest .. ':' .. remote_parent })
   return Proc.await({
     cmd = args,
     cwd = cwd,
@@ -143,7 +148,11 @@ function M.start_tunnel(cfg, parsed, lport, rport)
     lport = lport,
     rport = rport,
     alive = false,
+    stderr = {},
   }
+  function t.stderr_tail()
+    return Util.tail(table.concat(t.stderr, '\n'), 8)
+  end
   function t.kill()
     if t.job and t.job > 0 then
       pcall(vim.fn.jobstop, t.job)
@@ -156,6 +165,10 @@ function M.start_tunnel(cfg, parsed, lport, rport)
     on_stderr = function(_, data)
       for _, l in ipairs(data) do
         if l ~= '' then
+          t.stderr[#t.stderr + 1] = l
+          if #t.stderr > 20 then
+            table.remove(t.stderr, 1)
+          end
           Util.log('[tunnel] %s', l)
         end
       end

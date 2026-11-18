@@ -65,6 +65,17 @@ M.defaults = {
   ---shim still marks UIs detachable so SSH drops do not kill the server.
   hijack_quit = true,
 
+  ---How the local UI attaches to the remote server:
+  ---  "auto"      builtin TUI -> a `nvim --server ... --remote-ui` client in
+  ---              a terminal tab; external GUI -> |:connect|; headless ->
+  ---              print the command to run
+  ---  "terminal"  always open a terminal tab with the --remote-ui client
+  ---  "connect"   always use |:connect| (only re-attaches when the UI
+  ---              implements the "connect" UI event; the builtin TUI does
+  ---              not, where :connect is equivalent to |:detach|)
+  ---  "command"   never attach automatically; just show the command
+  attach = 'auto',
+
   ---Timeouts in seconds.
   timeouts = {
     ssh = 60, -- per ssh command (probe, server control, ...)
@@ -202,6 +213,9 @@ function M.validate(cfg)
   end
   if type(cfg.timeouts) ~= 'table' then
     return 'setup: "timeouts" must be a table of seconds'
+  end
+  if not vim.tbl_contains({ 'auto', 'terminal', 'connect', 'command' }, cfg.attach) then
+    return 'setup: "attach" must be one of "auto", "terminal", "connect", "command"'
   end
   for _, k in ipairs({ 'ssh', 'download', 'install', 'attach' }) do
     local v = cfg.timeouts[k]
