@@ -11,3 +11,6 @@ tests/.tmp/
 # editors
 .idea/
 .vscode/
+
+# test scratch output
+tests/.tmp*

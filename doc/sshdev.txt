@@ -5,143 +5,104 @@ Author: mistgc and sshdev.nvim contributors     MIT licensed    *sshdev*
 ==============================================================================
 INTRODUCTION						*sshdev-intro*
 
-The local Neovim UI is attached to a remote `nvim --headless --listen`
+A local Neovim UI is attached to a remote `nvim --headless --listen`
 server through an SSH port forward: >
 
-	local nvim UI  <->  ssh -N -L  <->  remote nvim --listen 127.0.0.1:<port>
+	local UI / --remote-ui client  <->  ssh -N -L  <->  remote nvim --listen
 
-Attaching uses a `nvim --server ... --remote-ui` UI client over the tunnel
-(for terminal users) or |:connect| (for GUI UIs that implement the
-"connect" UI event); see |sshdev-attach|. Editing happens entirely on the
-remote host while the interface, keymaps and plugins come from your
-uploaded config. On the remote server, sshdev.nvim hijacks the quit family
-into |:detach| so quitting locally never kills the server.
+Terminology ~
+							*sshdev-workspace*
+	workspace	the remote PROJECT DIRECTORY the server runs in,
+			e.g. "~/src/app".
+
+	profile		the remote state directory for one
+			(client machine, workspace) pair:
+							*sshdev-profile*
+			  <remote_root>/<local-hostname>-<workspace-path>/
+			The key uses the LOCAL hostname, so several client
+			machines sharing one remote account stay isolated
+			(config, plugins, data, session, logs).
 
 What sshdev.nvim does for a workspace:
 
-1. Uploads |stdpath()|'s "config" to `~/.sshdev.nvim/<workspace>/nvim-config/`
-   with scp, respecting `excludes`.
-2. Ensures a Neovim release matching your local version exists on the
-   remote (downloading through `proxy` / `download_mirror` if configured).
+1. Uploads |stdpath()|'s "config" to `<profile>/nvim-config/` with scp,
+   respecting `excludes`. Skipped when the local config fingerprint
+   matches the remote `.synced` marker.
+2. Ensures a Neovim release matching your local version exists under
+   `~/.sshdev.nvim/_bin/<version>-<asset>/` (downloading through `proxy` /
+   `download_mirror` if configured).
 3. Runs the remote nvim headless once so your plugin manager's bootstrap
    installs the plugins declared in your config.
-4. Starts a detached server in the remote folder you designated as the
-   workspace, forwards it, and attaches.
-5. Keeps the server alive across local quits and SSH drops (`:detach!`).
+4. Starts a detached server in the workspace, forwards it, and attaches.
+5. Persists the session: the server writes `<profile>/session.vim` when it
+   exits and restores it on the next start. There is no quit hijacking --
+   |:q| behaves normally.
 
-Requirements: Neovim >= 0.11 locally (for |:connect| / |:detach|), ssh/scp
-(OpenSSH >= 7.6), POSIX remote (Linux/macOS) with tar and curl. Key-based
-authentication is strongly recommended.
+Requirements: Neovim >= 0.11 locally, ssh/scp (OpenSSH >= 7.6), POSIX
+remote (Linux/macOS) with tar and curl. Key-based authentication is
+strongly recommended.
 
 ==============================================================================
 COMMANDS						*sshdev-commands*
 
 *:SSHdevConnect*
-:SSHdevConnect[!] [{dest}] [{dir}]	Bootstrap and attach.
+:SSHdevConnect[!] [{dest}] [{workspace}]	Connect (bootstrap + attach).
+	Without arguments, opens the connection picker (telescope when
+	installed, |vim.ui.select()| otherwise) with the remembered
+	connections plus a "new connection" entry.
 	{dest} is a destination "[user@]host[:port]" or a key from
-	`remotes`; defaults to `host`. {dir} is the remote folder to use as
-	the workspace (default: `remote_dir`, then the remote $HOME). The
-	workspace name defaults to basename({dir}), or the {dest} key,
-	or "default".
-	With !, a running server for the workspace is stopped and config,
-	nvim binary and plugins are re-synced before starting a fresh one.
-	Without !, a running server is re-attached as-is.
+	`remotes`; defaults to `host`. {workspace} is the remote project
+	directory (default: `workspace`, then the remote $HOME).
+	With !, a running server is stopped and config/plugins are
+	re-synced before starting a fresh one.
 
 *:SSHdevAttach*
-:SSHdevAttach [{dest}] [{dir}]	Attach to a RUNNING server (no bootstrap).
-	Fails if no server is running for the workspace; see
-	:SSHdevConnect to create one.
+:SSHdevAttach [{dest}] [{workspace}]	Attach to a RUNNING server (no
+	bootstrap). Fails if no server is running for the profile.
 
 *:SSHdevInstall*
-:SSHdevInstall [{dest}] [{dir}]	Bootstrap only: upload config, ensure the
-	remote nvim binary, run the headless plugin install. Does not
-	start or attach to a server.
+:SSHdevInstall [{dest}] [{workspace}]	Bootstrap only: binary, config,
+	headless plugin install. Does not start or attach.
 
 *:SSHdevSync*
-:SSHdevSync [{dest}] [{dir}]	Re-upload config + shim only. Use
-	:SSHdevConnect! to restart the server with the new config.
+:SSHdevSync [{dest}] [{workspace}]	Re-upload config + session helper.
+	Use :SSHdevConnect! to restart the server with the new config.
 
 *:SSHdevStop*
-:SSHdevStop			Stop the remote server of the current
-	session and kill the local tunnel.
+:SSHdevStop			Stop the remote server (SIGTERM, so it saves
+	session.vim) and kill the local tunnel.
 
 *:SSHdevStatus*
-:SSHdevStatus			Report local nvim version, session,
-	tunnel, remote server and configured destinations.
+:SSHdevStatus			Report session, workspace, profile,
+	tunnel, remote server and saved-session state.
+
+*:SSHdevHistory*
+:SSHdevHistory			Open the remembered-connection picker.
 
 *:SSHdevLog*
-:SSHdevLog			Open the sshdev log buffer (scp/ssh
-	output, plugin install output, tunnel messages).
+:SSHdevLog			Open the sshdev log buffer.
 
-On the remote server (while attached), the shim provides:
+Telescope (optional): >
 
-	:Detach, :SSHdevDetach	Detach this UI (same as :detach).
-	:SSHdevQuit, :SSHdevStop	Really quit the remote server.
-	:cq			Also really quits (not hijacked).
-
-While attached, :q / :wq / :qa ... are rewritten to :detach by the shim
-(see |sshdev-hijack|). If the SSH connection drops, the remote server
-keeps running; :SSHdevConnect re-attaches to it.
+	:Telescope sshdev connections
+	require('telescope').extensions.sshdev.connections()
+<
+	`<C-d>` in the picker forgets the highlighted connection.
 
 ==============================================================================
-SETUP							*sshdev-setup* *sshdev-setup()*
+SESSION PERSISTENCE					*sshdev-session*
 
-Setup with defaults (all keys optional): >
+The remote server saves its Neovim session to `<profile>/session.vim`:
 
-	require('sshdev').setup({
-	  host = 'me@myhost',          -- default destination "[user@]host[:port]"
-	  remotes = { work = 'me@work.example.com:2222' },
-	  remote_dir = '~/work',       -- default remote workspace folder
-	  workspace = 'myws',          -- force the workspace name
-	  ssh_bin = 'ssh', scp_bin = 'scp',
-	  ssh_args = { '-i', '~/.ssh/id_ed25519' },
-	  remote_root = '~/.sshdev.nvim',
-	  nvim_version = 'auto',       -- "auto" | "v0.11.3" | "nightly" | "stable"
-	  proxy = 'http://127.0.0.1:7890',
-	  download_mirror = 'https://github.com/neovim/neovim/releases/download',
-	  install_commands = { 'Lazy! restore' },
-	  excludes = { '.git', '.github' },
-	  hijack_quit = true,
-	  attach = 'auto',             -- "auto" | "terminal" | "connect" | "command"
-	  timeouts = { ssh = 60, download = 600, install = 900, attach = 30 },
-	})
+	* on VimLeavePre (:q, :wq, :cquit, SIGTERM from :SSHdevStop, ...)
+	* on FocusLost / VimSuspend (best-effort snapshot)
 
-Host / remotes ~
-	`host` is used when :SSHdevConnect is called without arguments.
-	`remotes` maps workspace names to destinations; its keys are used
-	for command completion, and as the workspace name when no explicit
-	workspace/remote_dir is given.
+and restores it on the next start (VimEnter), so reconnecting brings back
+buffers, windows and layout. |:q| therefore behaves normally -- the server
+exits and the session is preserved for the next connection.
 
-Remote dir ~
-	The remote folder to use as the workspace. Absolute or "~/...".
-	The remote nvim server's |current-directory| is set to it.
-
-nvim_version ~
-	"auto" (default) installs the release matching your local nvim.
-	Dev builds fall back to "nightly" with a warning. Pin an exact
-	release ("v0.11.3", "0.11.3", "nightly", "stable") to control it.
-
-proxy / download_mirror ~
-	Both apply to the nvim download ON THE REMOTE host. `proxy` is
-	sent as http_proxy/https_proxy/all_proxy to curl; use it when the
-	remote cannot reach GitHub directly. `download_mirror` replaces
-	the base URL for mirrors.
-
-install_commands ~
-	Extra ex-commands appended to the headless install run (after your
-	config is sourced), e.g. { "Lazy! restore" } for lazy.nvim or
-	{ "PackerSync" } for packer. Your config's own bootstrap snippet
-	clones the plugin manager itself.
-
-excludes ~
-	Globs matched against paths relative to your config root.
-	Component or prefix matches exclude whole subtrees.
-
-hijack_quit ~
-	See |sshdev-hijack|.
-
-attach ~
-	How the local UI attaches to the remote server; see |sshdev-attach|.
+Configure with `session` (save/restore on/off) and `restore_session`
+(start clean while still saving). SIGKILL cannot be handled.
 
 ==============================================================================
 ATTACHING						*sshdev-attach*
@@ -162,57 +123,105 @@ client process over the tunnel instead: >
 	"connect"   use |:connect| tcp://127.0.0.1:<port>
 	"command"   do not attach; just report the command to run
 
-With "terminal", detaching (:q on the remote) closes the tab and returns
-to the local nvim; the remote server keeps running.
-
 ==============================================================================
 REMOTE LAYOUT						*sshdev-remote-layout*
 
-    ~/.sshdev.nvim/<workspace>/nvim-config/   your uploaded config
-    ~/.sshdev.nvim/<workspace>/xdg/{share,state,cache}/
-                                              isolated remote XDG dirs
-    ~/.sshdev.nvim/<workspace>/shim.lua       server-side helper
-    ~/.sshdev.nvim/<workspace>/server.{pid,addr,log}
-    ~/.sshdev.nvim/_bin/<version>-<asset>/    downloaded nvim releases
+    ~/.sshdev.nvim/_bin/<version>-<asset>/    nvim releases (shared)
+    ~/.sshdev.nvim/<local-host>-<ws-path>/    one profile
+        nvim-config/                          uploaded config
+        data/ state/ cache/                   XDG data/state/cache
+        session.lua                           session helper
+        session.vim                           saved session
+        .synced                               config fingerprint marker
+        server.pid server.addr server.log
 
-The remote nvim runs with `NVIM_APPNAME=nvim-config` and XDG dirs under
-the workspace, so its data/cache never collide with the remote user's own
-nvim or with other workspaces.
+The yserver runs with `NVIM_APPNAME=nvim-config`, with the XDG dirs
+pointing into the profile, so state never collides with the remote user's
+own nvim or with other profiles.
+
+The server is located through `<profile>/server.pid`; if that file is lost
+the scripts fall back to matching the unique command line
+("<profile>/session.lua"), so a lost pid file never starts a second server.
 
 ==============================================================================
-QUIT HIJACK						*sshdev-hijack*
+SETUP							*sshdev-setup* *sshdev-setup()*
 
-While a UI is attached, typed ex commands execute on the REMOTE server, so
-the hijack lives there: the shim installs `cnoreabbrev <expr>` rewriting
-the whole command line when it is exactly a quit word: >
+Setup with defaults (all keys optional): >
 
-	:q / :quit        -> :Detach      (plain :detach)
-	:qa / :qall / :wq / :wqa / :x / :xit / :exit / ...
-	                   -> :DetachW     (:wall then :detach)
+	require('sshdev').setup({
+	  host = 'me@myhost',          -- default destination
+	  remotes = { work = 'me@work.example.com:2222' },
+	  workspace = '~/src/app',     -- default remote project directory
+	  profile = nil,               -- force the profile dir name
+	  session = true,              -- save <profile>/session.vim on exit
+	  restore_session = true,      -- restore it on start
+	  ssh_bin = 'ssh', scp_bin = 'scp',
+	  ssh_args = { '-i', '~/.ssh/id_ed25519' },
+	  remote_root = '~/.sshdev.nvim',
+	  nvim_version = 'auto',       -- "auto" | "v0.12.6" | "nightly" | "stable"
+	  proxy = 'http://127.0.0.1:7890',
+	  download_mirror = 'https://github.com/neovim/neovim/releases/download',
+	  install_commands = { 'Lazy! restore' },
+	  excludes = { '.git', '.github' },
+	  attach = 'auto',             -- "auto" | "terminal" | "connect" | "command"
+	  history = true,              -- remember connections for the picker
+	  history_limit = 50,
+	  timeouts = { ssh = 60, download = 600, install = 900, attach = 30 },
+	})
 
-(the replacements are single words because the :cnoreabbrev command line
-splits at "|"). The ZQ / ZZ keys are remapped to :Detach / :DetachW too.
+host / remotes ~
+	`host` is used when :SSHdevConnect is called without arguments.
+	`remotes` maps names to destinations; its keys complete for
+	:SSHdevConnect.
 
-`:cq` is not mapped, and the shim defines :SSHdevQuit for a real exit.
-Mapping-triggered quits (e.g. a mapping running `:qall` directly) bypass
-cmdline abbreviations — quit your remote session with :cq /
-:SSHdevQuit instead.
+workspace ~
+	The remote project directory. Absolute or "~/...". The remote nvim
+	server's |current-directory| is set to it and it names the profile.
 
-The shim also runs `:detach!` whenever a UI attaches, marking it
-detachable: SSH drops leave the server running for re-attachment.
+profile ~
+	Force the profile directory name. Default:
+	"<local-hostname>-<workspace-path>". Both clients and workspaces
+	stay isolated; the picker remembers them for you.
+
+nvim_version ~
+	"auto" (default) installs the release matching your local nvim.
+	Dev builds fall back to "nightly" with a warning.
+
+proxy / download_mirror ~
+	Both apply to the nvim download ON THE REMOTE host.
+
+install_commands ~
+	Extra ex-commands for the headless install run (after your config is
+	sourced), e.g. { "Lazy! restore" }.
+
+excludes ~
+	Globs matched against paths relative to your config root.
+
+session / restore_session ~
+	See |sshdev-session|.
+
+attach ~
+	See |sshdev-attach|.
+
+history / history_limit ~
+	Remembered connections for the :SSHdevConnect picker, stored in
+	|stdpath()|'s "data"/sshdev/history.json. Entries keep the full
+	destination including the ssh port.
 
 ==============================================================================
 TROUBLESHOOTING					*sshdev-troubleshooting*
 
 :SSHdevLog shows scp/ssh output, plugin install output and tunnel
-messages; the remote server log is ~/.sshdev.nvim/<workspace>/server.log.
+messages; the remote server log is `<profile>/server.log`.
 
-- "ssh connection failed" — check key auth works: `ssh <dest> true`.
-- "no :connect command" — local Neovim is < 0.11.
-- Tunnel dead after a network change — re-run :SSHdevConnect; it starts a
-  fresh tunnel and re-attaches.
-- Port collisions — local/remote ports are deterministic per
-  (destination, workspace); connect retries with incremented remote
-  ports automatically.
+- "ssh connection failed" -- check key auth works: `ssh <dest> true`.
+- Slow first connect -- the nvim release and all plugins are downloaded
+  once per remote; subsequent connects reuse them.
+- Session not restored -- check that the server exited normally (SIGKILL
+  cannot save) and that `restore_session` is true.
+- Port collisions -- local/remote ports are deterministic per profile;
+  start retries with incremented remote ports automatically.
+- Remote plugin install skipped unexpectedly -- the config fingerprint is
+  unchanged; use :SSHdevConnect! to force a re-sync.
 
  vim:tw=78:ts=8:noet:ft=help:norl:

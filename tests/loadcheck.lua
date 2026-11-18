@@ -17,6 +17,8 @@ local modules = {
   'sshdev.proc',
   'sshdev.ssh',
   'sshdev.bootstrap',
+  'sshdev.history',
+  'sshdev.picker',
   'sshdev.session',
   'sshdev.health',
   'sshdev',
@@ -33,13 +35,24 @@ for _, m in ipairs(modules) do
   end
 end
 
--- the shim must be a no-op outside a sshdev remote and compile cleanly
-local ok, err = loadfile(root .. '/scripts/remote_shim.lua')
+-- the remote helper must be a no-op outside a sshdev remote and compile
+local ok, err = loadfile(root .. '/scripts/remote_session.lua')
 if ok then
-  print('OK:   scripts/remote_shim.lua (compiles)')
+  print('OK:   scripts/remote_session.lua (compiles)')
 else
   failures = failures + 1
-  print(('FAIL: scripts/remote_shim.lua: %s'):format(tostring(err)))
+  print(('FAIL: scripts/remote_session.lua: %s'):format(tostring(err)))
+end
+
+-- the telescope extension is only loadable when telescope is installed;
+-- without it, require must fail with a plain "module not found"
+local tok, terr = pcall(require, 'telescope._extensions.sshdev')
+local missing_optional = not tok and tostring(terr):find("'telescope' not found", 1, true) ~= nil
+if tok or missing_optional then
+  print('OK:   lua/telescope/_extensions/sshdev.lua (guarded)')
+else
+  failures = failures + 1
+  print(('FAIL: telescope extension: %s'):format(tostring(terr)))
 end
 
 if failures > 0 then

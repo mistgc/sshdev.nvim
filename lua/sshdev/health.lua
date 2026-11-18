@@ -38,15 +38,27 @@ function M.check()
   -- 3. configuration sanity
   local remotes = vim.tbl_keys(cfg.remotes or {})
   if cfg.host or #remotes > 0 then
-    vim.health.ok(('destinations configured: %s'):format(table.concat(vim.tbl_extend('keep', remotes, cfg.host and { cfg.host } or {}), ', ')))
+    vim.health.ok(
+      ('destinations configured: %s'):format(
+        table.concat(vim.tbl_extend('keep', remotes, cfg.host and { cfg.host } or {}), ', ')
+      )
+    )
   else
-    vim.health.info('no destination configured yet: pass one to :SSHdevConnect or set setup({ host = "user@host" })')
+    vim.health.info('no destination configured yet: :SSHdevConnect opens the picker, or set setup({ host = "user@host" })')
   end
   if cfg.proxy then
     vim.health.ok(('download proxy: %s (applies to nvim downloads ON THE REMOTE)'):format(cfg.proxy))
   end
   if cfg.nvim_version ~= 'auto' then
     vim.health.info(('nvim_version pinned to %q'):format(cfg.nvim_version))
+  end
+  vim.health.info(('local hostname namespace: %s'):format(require('sshdev.util').os_hostname()))
+  vim.health.ok(('session persistence: %s'):format(cfg.session and 'on (session.vim)' or 'off'))
+  vim.health.info(('attach strategy: %s'):format(cfg.attach))
+
+  local hist = require('sshdev.history').list()
+  if #hist > 0 then
+    vim.health.ok(('%d remembered connection(s)'):format(#hist))
   end
 
   -- 4. remote reachability (bounded, synchronous)

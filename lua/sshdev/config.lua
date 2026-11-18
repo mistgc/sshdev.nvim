@@ -1,7 +1,12 @@
 --- Configuration for sshdev.nvim (`require("sshdev").setup(opts)`).
 ---
---- Options are validated eagerly so mistakes surface at setup time instead
---- of in the middle of a connect run.
+--- Terminology:
+---   * workspace       -- the remote PROJECT DIRECTORY (e.g. ~/src/app)
+---   * profile         -- remote state dir for (local host, workspace):
+---                        <remote_root>/<local-hostname>-<workspace-path>/
+---                        It holds the uploaded config, plugins, data,
+---                        session.vim and logs, isolating different client
+---                        machines that share one remote account.
 
 local Util = require('sshdev.util')
 
@@ -11,21 +16,28 @@ local islist = vim.islist or vim.tbl_islist
 local M = {}
 
 M.defaults = {
-  ---Default destination "[user@]host[:port]" (used when :SSHdevConnect
-  ---is called without arguments).
+  ---Default destination "[user@]host[:port]" used by :SSHdevConnect without
+  ---arguments (and as a suggestion in the connection picker).
   host = nil,
 
-  ---Named destinations: workspace name -> "[user@]host[:port]".
-  ---` :SSHdevConnect <name> ` connects to it.
+  ---Named destinations: name -> "[user@]host[:port]".
   remotes = {},
 
-  ---Remote folder to use as the workspace (the remote nvim server's cwd).
-  ---"~/..." or absolute. Default: remote $HOME.
-  remote_dir = nil,
-
-  ---Force the workspace name (default: basename of the remote dir,
-  ---or "default" when it is the remote $HOME).
+  ---Default remote workspace (the remote PROJECT DIRECTORY the server runs
+  ---in). Absolute or "~/...". Defaults to the remote $HOME.
   workspace = nil,
+
+  ---Force the profile directory name (default:
+  ---"<local-hostname>-<workspace-path>").
+  profile = nil,
+
+  ---Save the remote nvim session to <profile>/session.vim when the server
+  ---exits, and restore it on the next start.
+  session = true,
+
+  ---Restore session.vim when (re)starting the server. Set false to start
+  ---clean while still saving (e.g. :SSHdevConnect with a fresh session).
+  restore_session = true,
 
   ---ssh/scp binaries.
   ssh_bin = 'ssh',
@@ -35,7 +47,7 @@ M.defaults = {
   ---e.g. { "-i", "~/.ssh/id_ed25519", "-o", "Compression=yes" }.
   ssh_args = {},
 
-  ---Remote root for sshdev state: "<root>/<workspace>/".
+  ---Remote root for all sshdev state: "<root>/<profile>/" and "<root>/_bin/".
   remote_root = '~/.sshdev.nvim',
 
   ---Which nvim release to install on the remote:
@@ -53,28 +65,24 @@ M.defaults = {
 
   ---Extra headless ex-commands to run when bootstrapping plugins on the
   ---remote, e.g. { "Lazy! restore" } (lazy.nvim) or { "PackerSync" }.
-  ---Your config's bootstrap snippet handles cloning the plugin manager;
-  ---these commands run AFTER your init has been sourced.
   install_commands = {},
 
   ---Globs of files to exclude from the config upload.
   excludes = { '.git', '.github' },
 
-  ---Hijack :q/:wq/... into :detach on the remote server (the whole point
-  ---of sshdev.nvim). Set to false to keep normal quit semantics; the
-  ---shim still marks UIs detachable so SSH drops do not kill the server.
-  hijack_quit = true,
-
   ---How the local UI attaches to the remote server:
-  ---  "auto"      builtin TUI -> a `nvim --server ... --remote-ui` client in
-  ---              a terminal tab; external GUI -> |:connect|; headless ->
-  ---              print the command to run
-  ---  "terminal"  always open a terminal tab with the --remote-ui client
-  ---  "connect"   always use |:connect| (only re-attaches when the UI
-  ---              implements the "connect" UI event; the builtin TUI does
-  ---              not, where :connect is equivalent to |:detach|)
-  ---  "command"   never attach automatically; just show the command
+  ---  Builtin TUI -> a `nvim --server ... --remote-ui` client in a
+  ---  terminal tab (the TUI cannot re-attach itself: |:connect| there is
+  ---  equivalent to |:detach|); external GUI -> |:connect|; headless ->
+  ---  print the command.
   attach = 'auto',
+
+  ---Record every connection and offer a picker when :SSHdevConnect is called
+  ---without arguments (telescope when available, vim.ui.select otherwise).
+  history = true,
+
+  ---Maximum number of remembered connections.
+  history_limit = 50,
 
   ---Timeouts in seconds.
   timeouts = {
@@ -117,7 +125,19 @@ end
 ---@return table cfg
 ---@return string? err
 function M.build(opts)
-  local cfg = merge(vim.deepcopy(M.defaults), opts or {})
+  opts = vim.deepcopy(opts or {})
+  -- deprecated alias: remote_dir -> workspace
+  if opts.remote_dir ~= nil then
+    if opts.workspace == nil then
+      opts.workspace = opts.remote_dir
+    end
+    opts.remote_dir = nil
+  end
+  -- removed option: quit hijacking (session save/restore replaced it).
+  -- Drop it silently so old configs keep working instead of carrying a
+  -- meaningless key around.
+  opts.hijack_quit = nil
+  local cfg = merge(vim.deepcopy(M.defaults), opts)
   local err = M.validate(cfg)
   return cfg, err
 end
@@ -148,11 +168,11 @@ function M.validate(cfg)
     end
   end
   if type(cfg.remotes) ~= 'table' then
-    return 'setup: "remotes" must be a table: workspace name -> destination'
+    return 'setup: "remotes" must be a table: name -> destination'
   end
   for name, dest in pairs(cfg.remotes) do
     if type(name) ~= 'string' or name == '' then
-      return 'setup: "remotes" keys must be non-empty workspace names'
+      return 'setup: "remotes" keys must be non-empty names'
     end
     if type(dest) ~= 'string' then
       return ('setup: remotes["%s"] must be a destination string'):format(name)
@@ -162,14 +182,32 @@ function M.validate(cfg)
       return ('setup: remotes["%s"]: %s'):format(name, err)
     end
   end
-  if cfg.remote_dir ~= nil and type(cfg.remote_dir) ~= 'string' then
-    return 'setup: "remote_dir" must be a string path'
+  if cfg.workspace ~= nil then
+    if type(cfg.workspace) ~= 'string' or cfg.workspace == '' then
+      return 'setup: "workspace" must be a remote project directory path'
+    end
+    local w = cfg.workspace
+    if w:sub(1, 1) ~= '~' and w:sub(1, 1) ~= '/' then
+      return 'setup: "workspace" must be absolute or "~"-relative'
+    end
+    if w:find("['\r\n]") then
+      return 'setup: "workspace" must not contain quotes or newlines'
+    end
   end
-  if cfg.remote_dir and cfg.remote_dir:sub(1, 1) ~= '~' and cfg.remote_dir:sub(1, 1) ~= '/' then
-    return 'setup: "remote_dir" must be absolute or "~"-relative'
+  if cfg.profile ~= nil and (type(cfg.profile) ~= 'string' or cfg.profile == '') then
+    return 'setup: "profile" must be a non-empty directory name'
   end
-  if cfg.workspace ~= nil and type(cfg.workspace) ~= 'string' then
-    return 'setup: "workspace" must be a string'
+  if type(cfg.session) ~= 'boolean' then
+    return 'setup: "session" must be a boolean'
+  end
+  if type(cfg.restore_session) ~= 'boolean' then
+    return 'setup: "restore_session" must be a boolean'
+  end
+  if type(cfg.history) ~= 'boolean' then
+    return 'setup: "history" must be a boolean'
+  end
+  if type(cfg.history_limit) ~= 'number' or cfg.history_limit < 1 then
+    return 'setup: "history_limit" must be a positive number'
   end
   if type(cfg.ssh_bin) ~= 'string' or type(cfg.scp_bin) ~= 'string' then
     return 'setup: "ssh_bin" and "scp_bin" must be strings'
@@ -211,11 +249,11 @@ function M.validate(cfg)
   if not is_list_of_strings(cfg.excludes) then
     return 'setup: "excludes" must be a list of glob strings'
   end
-  if type(cfg.timeouts) ~= 'table' then
-    return 'setup: "timeouts" must be a table of seconds'
-  end
   if not vim.tbl_contains({ 'auto', 'terminal', 'connect', 'command' }, cfg.attach) then
     return 'setup: "attach" must be one of "auto", "terminal", "connect", "command"'
+  end
+  if type(cfg.timeouts) ~= 'table' then
+    return 'setup: "timeouts" must be a table of seconds'
   end
   for _, k in ipairs({ 'ssh', 'download', 'install', 'attach' }) do
     local v = cfg.timeouts[k]

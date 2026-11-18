@@ -50,6 +50,19 @@ function M.join_remote(base, ...)
   return (table.concat(parts, '/'):gsub('//+', '/'))
 end
 
+---Re-serialize a parsed destination, keeping the port when present.
+---("user@host:2222" must survive a round trip through history/state, or a
+---later reconnect would silently fall back to port 22.)
+---@param parsed table from M.parse_dest()
+---@return string
+function M.format_dest(parsed)
+  local base = parsed.dest or ((parsed.user and parsed.user .. '@' or '') .. (parsed.host or ''))
+  if parsed.port then
+    return ('%s:%d'):format(base, parsed.port)
+  end
+  return base
+end
+
 ---Resolve a possibly "~"-relative remote path against the remote $HOME.
 ---@param path string
 ---@param home string
@@ -205,21 +218,69 @@ end
 -- Workspace names / ports
 ------------------------------------------------------------------------
 
----Sanitize a workspace name: [A-Za-z0-9._-], max 48 chars, no "." / "..".
+---Small stable string hash (djb2), used for short suffixes and port choices.
+---@param s string
+---@return integer
+local function djb2(s)
+  local h = 5381
+  for i = 1, #s do
+    h = (h * 33 + s:byte(i)) % 2147483648
+  end
+  return h
+end
+
+---Sanitize a string into a single safe path segment:
+---[A-Za-z0-9._-], no leading/trailing punctuation, never "." / "..".
 ---@param name any
+---@param max_len integer|nil
 ---@return string
-function M.sanitize_ws(name)
+function M.sanitize_segment(name, max_len)
   if type(name) ~= 'string' then
     return 'default'
   end
-  local s = name:gsub('[^%w%.%-_]+', '-'):gsub('^[-%.]+', ''):gsub('[-%.]+$', '')
+  local s = name:gsub('[^%w%.%-_]+', '-'):gsub('%-+', '-'):gsub('^[-%.]+', ''):gsub('[-%.]+$', '')
   if s == '' or s == '.' or s == '..' then
     return 'default'
   end
-  if #s > 48 then
-    s = s:sub(1, 48)
+  local limit = max_len or 100
+  if #s > limit then
+    -- keep it readable but collision-safe
+    local hash = ('%08x'):format(djb2(s))
+    s = s:sub(1, limit - 9) .. '-' .. hash
   end
   return s
+end
+
+---Shortest stable local hostname, used to namespace remote profiles so that
+---two different laptops sharing a remote account never collide.
+---@return string
+function M.os_hostname()
+  local ok, name = pcall(function()
+    return uv.os_gethostname()
+  end)
+  if not ok or type(name) ~= 'string' or name == '' then
+    name = 'localhost'
+  end
+  -- strip a domain suffix: "macbook.local" -> "macbook"
+  name = name:gsub('%.local$', ''):gsub('%..*$', '')
+  return M.sanitize_segment(name, 32)
+end
+
+---Profile key for a remote workspace: "<local-hostname>-<workspace-path>".
+---
+---The workspace is the remote PROJECT DIRECTORY (e.g. /home/me/src/app);
+---the key is derived from the LOCAL hostname so that several client
+---machines can use the same remote account without sharing state.
+---@param local_hostname string
+---@param workspace_abs string absolute remote path
+---@return string
+function M.profile_key(local_hostname, workspace_abs)
+  local host = M.sanitize_segment(local_hostname or 'localhost', 32)
+  local ws = tostring(workspace_abs or '')
+  -- "/home/me/src/app" -> "home-me-src-app"
+  ws = ws:gsub('/+', '-'):gsub('^-+', ''):gsub('-+$', '')
+  local ws_key = M.sanitize_segment(ws, 80)
+  return host .. '-' .. ws_key
 end
 
 local function djb2(s)
@@ -582,17 +643,15 @@ function M.plugin_root()
   return root
 end
 
----Stage the local nvim config into
----stdpath("cache")/sshdev/stage-<ws>/nvim-config (wiping the previous stage).
----Returns parent dir and dir name so scp can run with a relative source
----(avoids the Windows "C:" drive-letter ambiguity in scp arguments).
+---Stage the local nvim config into stdpath("cache")/sshdev/stage/nvim-config
+---(wiping the previous stage). Returns the parent dir; scp is then run with
+---a RELATIVE source from there (avoids the Windows "C:" ambiguity).
 ---@param cfg table
----@param ws string
 ---@return string? parent
 ---@return string? dirname_or_err
-function M.stage_config(cfg, ws)
+function M.stage_config(cfg)
   local src = vim.fs.normalize(vim.fn.stdpath('config'))
-  local parent = M.fs_join(vim.fs.normalize(vim.fn.stdpath('cache')), 'sshdev', 'stage-' .. ws)
+  local parent = M.fs_join(vim.fs.normalize(vim.fn.stdpath('cache')), 'sshdev', 'stage')
   local dst = M.fs_join(parent, 'nvim-config')
   M.rmrf(parent)
   local globs = cfg.excludes or {}
@@ -604,6 +663,53 @@ function M.stage_config(cfg, ws)
     return nil, err
   end
   return parent, 'nvim-config'
+end
+
+---Fingerprint of the LOCAL nvim config (respecting upload excludes).
+---
+---Used to skip the scp upload + headless plugin install when nothing
+---changed since the last successful sync for a workspace profile.
+---Cheap and order-independent: path + size + mtime of every file.
+---@param cfg table
+---@return string
+function M.config_fingerprint(cfg)
+  local src = vim.fs.normalize(vim.fn.stdpath('config'))
+  local globs = cfg.excludes or {}
+  local parts = {}
+
+  local function walk(dir, rel)
+    local handle = uv.fs_scandir(dir)
+    if not handle then
+      return
+    end
+    while true do
+      local name, typ = uv.fs_scandir_next(handle)
+      if not name then
+        break
+      end
+      local child_rel = (rel ~= '' and (rel .. '/') or '') .. name
+      if not M.excluded(child_rel, globs) then
+        local path = M.fs_join(dir, name)
+        local real = typ
+        if typ == 'link' then
+          local st = uv.fs_stat(path)
+          real = st and st.type or nil
+        end
+        if real == 'directory' then
+          walk(path, child_rel)
+        elseif real == 'file' then
+          local st = uv.fs_stat(path)
+          parts[#parts + 1] = ('%s:%d:%d'):format(child_rel, st and st.size or 0, st and st.mtime.sec or 0)
+        end
+      end
+    end
+  end
+
+  if uv.fs_stat(src) then
+    walk(src, '')
+  end
+  table.sort(parts)
+  return ('%08x%08x'):format(djb2(table.concat(parts, '\n')), #parts)
 end
 
 ---Absolute remote root path (~-expanded) for a configuration.
