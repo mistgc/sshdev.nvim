@@ -56,7 +56,7 @@ With `lazy.nvim`:
 
 ```lua
 {
-  'you/sshdev.nvim',
+  'mistgc/sshdev.nvim',
   cmd = { 'SSHdevConnect', 'SSHdevAttach', 'SSHdevInstall', 'SSHdevSync',
           'SSHdevStop', 'SSHdevStatus', 'SSHdevHistory', 'SSHdevLog' },
   config = function()
@@ -73,7 +73,7 @@ With `lazy.nvim`:
 With telescope (optional — enables the fuzzy connection picker):
 
 ```lua
-{ 'nvim-telescope/telescope.nvim', dependencies = { 'you/sshdev.nvim' } }
+{ 'mistgc/sshdev.nvim', dependencies = { 'nvim-telescope/telescope.nvim' } }
 -- setup() loads the extension automatically when telescope is present
 ```
 
