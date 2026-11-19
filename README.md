@@ -244,6 +244,13 @@ or `:lua require('telescope').extensions.sshdev.connections()`.
 | `FocusLost` / `VimSuspend` | best-effort snapshot |
 | next `:SSHdevConnect` | server restarts and `session.vim` is restored (VimEnter) |
 
+Restored buffers get their `FileType` re-established explicitly: session
+sourcing loads their content with the read events suppressed, which would
+otherwise leave them without filetype detection — no syntax highlighting,
+no LSP, no treesitter. The re-fire happens right after the restore and
+again when the first UI attaches (lazy-loaded plugins register their
+handlers only then).
+
 Sessions live in the workspace profile: two workspaces can share one nvim
 profile (config + plugins) while keeping independent buffers/layouts.
 

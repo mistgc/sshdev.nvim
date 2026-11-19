@@ -16,6 +16,10 @@
 --   1. restore session.vim when the server (re)starts, if configured
 --   2. save session.vim when the server exits, so the next :SSHdevConnect
 --      brings the user back to the same buffers/windows/layout
+--   3. re-establish FileType on the restored buffers: session sourcing
+--      reads them with the ordinary read events suppressed (no
+--      BufReadPost/FileType), so treesitter/LSP/syntax never attach
+--      without this step
 --
 -- Self-contained: it must not require any plugin (the uploaded config may
 -- not include sshdev.nvim).
@@ -36,6 +40,40 @@ end
 
 local restored = false
 
+---Re-establish FileType on the buffers the session restored.
+---
+---Session sourcing loads the buffers' content but skips the read events
+---(no BufReadPost -> no filetype detection, no FileType), so the restored
+---buffers end up with content but filetype "" and treesitter/LSP/syntax
+---never attach -- until this repairs it:
+---   * buffers without a filetype get one through explicit detection
+---     (vim.filetype.match); assigning 'filetype' fires FileType
+---   * buffers that already have one get FileType re-fired, for handlers
+---     that were registered only later (lazy.nvim and friends defer
+---     plugin loading until the first UI attaches)
+local function reestablish_filetypes()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.fn.buflisted(b) == 1 then
+      if vim.bo[b].filetype == '' then
+        local ft = vim.filetype.match({ buf = b })
+        if type(ft) == 'string' and ft ~= '' then
+          pcall(function()
+            vim.bo[b].filetype = ft -- assigning fires FileType
+          end)
+        end
+      else
+        -- re-fire FileType in the buffer's own context; handlers that
+        -- registered after the restore (lazy loading at UIEnter) attach now
+        pcall(function()
+          vim.api.nvim_buf_call(b, function()
+            vim.cmd('doautocmd FileType')
+          end)
+        end)
+      end
+    end
+  end
+end
+
 ---Restore the saved session once the user config finished loading.
 local function restore_session()
   if restored or not restore or session_path == '' then
@@ -45,6 +83,18 @@ local function restore_session()
   if vim.fn.filereadable(session_path) == 1 then
     local ok = pcall(vim.cmd, 'silent! source ' .. esc(session_path))
     if ok then
+      -- handlers registered at init time attach right away; plugin
+      -- managers that defer loading until UIEnter get a second pass
+      reestablish_filetypes()
+      vim.api.nvim_create_autocmd('UIEnter', {
+        once = true,
+        callback = function()
+          -- lazy loading settles around UIEnter; give it a moment so the
+          -- second pass sees the late-registered FileType handlers
+          vim.defer_fn(reestablish_filetypes, 300)
+        end,
+        desc = 'sshdev: re-attach treesitter/LSP to the restored buffers',
+      })
       pcall(vim.api.nvim_echo, {
         { ('sshdev: session restored from %s'):format(session_path), 'None' },
       }, false, {})

@@ -162,6 +162,12 @@ and restores it on the next start (VimEnter), so reconnecting brings back
 buffers, windows and layout. |:q| therefore behaves normally -- the server
 exits and the session is preserved for the next connection.
 
+Session sourcing reads the buffers with the ordinary read events
+suppressed, so sshdev explicitly re-establishes `FileType` on them: once
+right after the restore, and again shortly after the first UI attaches
+(when lazy-loaded plugins have registered their handlers). Without this,
+restored buffers would show no syntax highlighting, treesitter or LSP.
+
 Sessions are per workspace; plugins/state are per nvim profile, so two
 workspaces can share a config and still keep independent sessions.
 
