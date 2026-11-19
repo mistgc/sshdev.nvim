@@ -68,7 +68,9 @@ MIT licensed.
   `:detach`), `ssh` and `scp` (OpenSSH ≥ 7.6).
 - **Remote** (Linux/macOS): `sh`, `tar`, `curl`, `sshd` allowing TCP
   forwarding.
-- Key-based authentication is strongly recommended.
+- Key-based authentication is strongly recommended. Password-only hosts
+  work with `auth = 'password'` (OpenSSH client ≥ 8.4, see
+  [Password authentication](#password-authentication)).
 
 ## Installing
 
@@ -105,6 +107,8 @@ With telescope (optional — enables the fuzzy pickers):
 :SSHdevConnect me@myhost             " any [user@]host[:port]
 :SSHdevConnect me@myhost:2222 ~/src/app
 :SSHdevConnect work                  " a destination named in setup({ remotes = ... })
+:SSHdevConnect me@myhost:2222 ~/src/app --auth=password
+                                     " ask the ssh password once and use it
 :SSHdevConnect me@myhost ~/src/app --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
                                      " new workspace reusing an existing nvim profile
 :SSHdevConnect!                      " restart server, re-sync into the profile
@@ -279,6 +283,52 @@ back after quitting the remote one).
 
 Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
 
+## Password authentication
+
+Key/ssh-agent auth is the default (`auth = 'auto'`: no prompts, fully
+non-interactive). For hosts that only accept passwords:
+
+```lua
+require('sshdev').setup({
+  host = 'me@myhost',
+  auth = 'password',
+})
+```
+
+or as a one-shot flag (also works for `:SSHdevAttach`, `:SSHdevInstall`,
+`:SSHdevSync` and the `:SSHdevConnect` picker):
+
+```vim
+:SSHdevConnect me@myhost:2222 ~/src/app --auth=password
+```
+
+How it works:
+
+- the password is requested once per destination with `inputsecret()`
+  (masked) and kept **only in memory** for the lifetime of the local nvim
+  session — never on disk, in history or in the log;
+- every ssh/scp/tunnel call then receives `SSH_ASKPASS` — a tiny helper
+  script under `stdpath('cache')/sshdev/` that prints `$SSHDEV_PASS` —
+  plus `SSH_ASKPASS_REQUIRE=force`, so OpenSSH authenticates without a
+  terminal. The helper itself contains **no secret**. Verified against
+  Windows OpenSSH 9.5, including detached `ssh -N -L` tunnel processes;
+- a rejected password (`Permission denied (publickey,password)`) is
+  detected and the cached entry dropped, so the next `:SSHdevConnect`
+  asks again.
+
+Requirements & caveats:
+
+- OpenSSH **≥ 8.4** client (`SSH_ASKPASS_REQUIRE`; the Windows inbox client
+  has it since 8.6 — 9.5 verified). `:checkhealth sshdev` reports the
+  capability and the helper status.
+- The password is visible in the environment of the spawned ssh/scp
+  children (including a tunnel kept alive after nvim exits) — the
+  accepted trade-off of this mode.
+- Single-factor passwords only: 2FA / keyboard-interactive prompts cannot
+  be answered (use key auth for those).
+- On Windows, a `!` in the password cannot be passed (cmd delayed
+  expansion); sshdev warns when it sees one.
+
 ## Upgrading from the old single-profile layout
 
 Before this refactor every `(client, workspace)` had one directory containing
@@ -311,6 +361,8 @@ require('sshdev').setup({
 
   ssh_bin = 'ssh', scp_bin = 'scp',
   ssh_args = { '-i', '~/.ssh/id_ed25519' },
+  auth = 'auto',             -- "auto" (key/agent) | "password" (askpass)
+
   remote_root = '~/.sshdev.nvim',
 
   nvim_version = 'auto',     -- "auto" | "v0.12.6" | "nightly" | "stable"
@@ -369,6 +421,11 @@ the remote session returns you to the local one.
 You want the remote session to behave exactly like home. The upload skips
 `excludes` entries, lands in a content-addressed profile and is reused by every
 workspace with the same config.
+
+**How do I connect to a host that only accepts passwords?**
+Set `auth = 'password'` (or pass `--auth=password` once). You are prompted
+once per destination; the password stays in memory and is fed to ssh via
+`SSH_ASKPASS`. `:checkhealth sshdev` verifies your client supports it.
 
 **How do I get rid of old nvim profiles?**
 Each config edit creates a new `nvim-profiles/--…--` directory (the old one is

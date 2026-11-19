@@ -24,6 +24,7 @@
 --- There is no quit hijacking: the remote server simply quits on :q and
 --- saves session.vim on the way out, so the next connection restores it.
 
+local Auth = require('sshdev.auth')
 local Bootstrap = require('sshdev.bootstrap')
 local Config = require('sshdev.config')
 local History = require('sshdev.history')
@@ -355,6 +356,17 @@ local function prepare_probe(opts)
   if not parsed then
     Util.report_error(derr)
     return nil
+  end
+
+  -- password mode: ask BEFORE the first ssh round trip, so the prompt is
+  -- the first thing the user sees (Ssh.* would prompt lazily as a
+  -- fallback for flows that do not pass through here).
+  if Auth.enabled(cfg) then
+    local pw, aerr = Auth.ensure(cfg, parsed)
+    if not pw then
+      Util.report_error(aerr)
+      return nil
+    end
   end
 
   local probe, perr = Bootstrap.probe(cfg, parsed)
@@ -894,6 +906,9 @@ end
 function M.pick(opts)
   opts = opts or {}
   local cfg = Config.get()
+  if opts.cfg then
+    cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
+  end
   local Picker = require('sshdev.picker')
   Picker.select(cfg, function(entry)
     if not entry then
@@ -904,6 +919,7 @@ function M.pick(opts)
       workspace = entry.workspace,
       nvim_profile = entry.nvim_profile_key,
       force = opts.force,
+      cfg = opts.cfg,
     })
   end)
 end
@@ -915,6 +931,9 @@ end
 function M.pick_history(opts)
   opts = opts or {}
   local cfg = Config.get()
+  if opts.cfg then
+    cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
+  end
   local Picker = require('sshdev.picker')
   Proc.launch(function()
     Picker.select_history(cfg, function(entry)
@@ -925,6 +944,7 @@ function M.pick_history(opts)
         dest = entry.dest,
         workspace = entry.workspace,
         nvim_profile = entry.nvim_profile_key,
+        cfg = opts.cfg,
       })
     end, { dest = opts.dest })
   end)

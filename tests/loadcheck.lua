@@ -17,6 +17,7 @@ local modules = {
   'sshdev.layout',
   'sshdev.config',
   'sshdev.proc',
+  'sshdev.auth',
   'sshdev.ssh',
   'sshdev.remote_scripts',
   'sshdev.bootstrap',

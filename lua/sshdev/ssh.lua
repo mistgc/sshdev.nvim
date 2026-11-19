@@ -10,9 +10,14 @@
 ---
 --- All functions take the PARSED destination table from
 --- `Util.parse_dest` (with .dest / .user / .host / .port), not a raw string.
+---
+--- In password mode (cfg.auth = "password", see sshdev.auth) every spawn
+--- gets the askpass environment overlay via Auth.env(), so ssh/scp/tunnel
+--- authentication never needs a terminal.
 
 local M = {}
 
+local Auth = require('sshdev.auth')
 local Proc = require('sshdev.proc')
 local Util = require('sshdev.util')
 
@@ -62,12 +67,17 @@ function M.run_script(cfg, parsed, script, opts)
   opts = opts or {}
   local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
   vim.list_extend(args, { '--', parsed.dest, 'sh', '-s' })
-  return Proc.await({
+  local res = Proc.await({
     cmd = args,
     input = script,
+    env = Auth.env(cfg, parsed),
     timeout = opts.timeout and opts.timeout * 1000 or nil,
     label = opts.label,
   })
+  if Auth.is_auth_failure(res) then
+    Auth.forget(parsed)
+  end
+  return res
 end
 
 ---scp one local file (relative to `cwd`) to an absolute remote path.
@@ -87,12 +97,17 @@ end
 function M.upload_file(cfg, parsed, cwd, filename, remote_path, timeout_s)
   local args = base_args(cfg, parsed, cfg.scp_bin, 'scp')
   vim.list_extend(args, { filename, parsed.dest .. ':' .. remote_path })
-  return Proc.await({
+  local res = Proc.await({
     cmd = args,
     cwd = cwd,
+    env = Auth.env(cfg, parsed),
     timeout = timeout_s and timeout_s * 1000 or nil,
     label = 'scp',
   })
+  if Auth.is_auth_failure(res) then
+    Auth.forget(parsed)
+  end
+  return res
 end
 
 ---scp one local directory (relative to `cwd`) INTO `remote_parent`
@@ -108,12 +123,17 @@ end
 function M.upload_dir(cfg, parsed, cwd, dirname, remote_parent, timeout_s)
   local args = base_args(cfg, parsed, cfg.scp_bin, 'scp')
   vim.list_extend(args, { '-C', '-r', dirname, parsed.dest .. ':' .. remote_parent })
-  return Proc.await({
+  local res = Proc.await({
     cmd = args,
     cwd = cwd,
+    env = Auth.env(cfg, parsed),
     timeout = timeout_s and timeout_s * 1000 or nil,
     label = 'scp',
   })
+  if Auth.is_auth_failure(res) then
+    Auth.forget(parsed)
+  end
+  return res
 end
 
 ---Start the local forward `ssh -N -L 127.0.0.1:lport -> 127.0.0.1:rport`.
@@ -143,6 +163,9 @@ function M.start_tunnel(cfg, parsed, lport, rport)
     '--',
     parsed.dest,
   })
+  -- password mode: the detached ssh process authenticates through askpass
+  -- (verified on Windows: detached, console-less children still run it)
+  local env = Auth.env(cfg, parsed)
   local t = {
     dest = parsed.dest,
     lport = lport,
@@ -162,6 +185,7 @@ function M.start_tunnel(cfg, parsed, lport, rport)
   end
   t.job = vim.fn.jobstart(args, {
     detach = true,
+    env = env,
     on_stderr = function(_, data)
       for _, l in ipairs(data) do
         if l ~= '' then
@@ -177,6 +201,9 @@ function M.start_tunnel(cfg, parsed, lport, rport)
       t.alive = false
       t.exit_code = code
       Util.log('[tunnel] exited code=%s', tostring(code))
+      if code ~= 0 and Auth.auth_failure_in(t.stderr_tail()) then
+        Auth.forget(parsed)
+      end
     end,
   })
   t.alive = type(t.job) == 'number' and t.job > 0

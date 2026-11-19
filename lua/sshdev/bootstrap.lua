@@ -19,6 +19,7 @@
 --- report machine-readable `SSHDEV:KEY=VALUE` lines; profile listings use
 --- TAB-separated `SSHDEV:WS=` / `SSHDEV:NP=` rows.
 
+local Auth = require('sshdev.auth')
 local Layout = require('sshdev.layout')
 local Scripts = require('sshdev.remote_scripts')
 local Ssh = require('sshdev.ssh')
@@ -92,10 +93,16 @@ function M.probe(cfg, parsed)
     label = 'ssh',
   })
   if res.code ~= 0 then
-    return nil, ('ssh connection to %s failed (exit %s)%s'):format(
+    local hint = ''
+    if Auth.enabled(cfg) and Auth.is_auth_failure(res) then
+      -- Ssh.run_script already dropped the cached password
+      hint = '\n(the password was rejected; run the command again to re-enter it)'
+    end
+    return nil, ('ssh connection to %s failed (exit %s)%s%s'):format(
       parsed.dest,
       res.code,
-      res.stderr ~= '' and (':\n' .. Util.tail(res.stderr, 5)) or ''
+      res.stderr ~= '' and (':\n' .. Util.tail(res.stderr, 5)) or '',
+      hint
     )
   end
   local kv = Util.parse_keyvals(res.stdout)

@@ -10,11 +10,13 @@ local function report(err)
   require('sshdev.util').report_error(err)
 end
 
----Parse the shared "[dest] [workspace] [--nvim-profile=<key>]" argument shape.
+---Parse the shared "[dest] [workspace] [--nvim-profile=<key>] [--auth=<mode>]"
+---argument shape.
 ---
 ---Flags may appear anywhere; at most two positional arguments remain:
 ---  :SSHdevConnect me@host ~/src/app --nvim-profile=--me-v0.12.6-1a2b3c4d--
 ---  :SSHdevConnect --nvim-profile --me-v0.12.6-1a2b3c4d-- me@host ~/src/app
+---  :SSHdevConnect me@host ~/src/app --auth=password
 ---@param o table user command args
 ---@return table|nil opts
 ---@return string|nil err
@@ -22,16 +24,41 @@ local function parse_args(o)
   local opts = { force = o.bang }
   local positional = {}
   local fargs = o.fargs or {}
+  local function set_auth(v)
+    if v ~= 'password' then
+      return ('--auth currently supports only "password" (got %s)'):format(v == '' and '(empty)' or v)
+    end
+    -- per-call config override; Session.prepare_probe merges it over setup()
+    opts.cfg = vim.tbl_deep_extend('force', opts.cfg or {}, { auth = v })
+    return nil
+  end
   local i = 1
   while i <= #fargs do
     local a = fargs[i]
     local inline = a:match('^%-%-nvim%-profile=(.*)$')
+    local auth = a:match('^%-%-auth=(.*)$')
     if inline then
       if inline == '' then
         return nil, '--nvim-profile needs a value like --<host>-<version>-<hash8>--'
       end
       opts.nvim_profile = inline
       i = i + 1
+    elseif auth then
+      local err = set_auth(auth)
+      if err then
+        return nil, err
+      end
+      i = i + 1
+    elseif a == '--auth' then
+      local n = fargs[i + 1]
+      if not n or n == '' then
+        return nil, '--auth needs a value: --auth=password'
+      end
+      local err = set_auth(n)
+      if err then
+        return nil, err
+      end
+      i = i + 2
     elseif a == '--nvim-profile' or a == '-p' then
       local n = fargs[i + 1]
       if not n or n == '' then
@@ -158,6 +185,10 @@ local function complete_args(arglead, cmdline, cursorpos)
     if flag:sub(1, #arglead) == arglead then
       return { flag }
     end
+    local authflag = '--auth=password'
+    if authflag:sub(1, #arglead) == arglead then
+      return { authflag }
+    end
     return {}
   end
 
@@ -207,7 +238,7 @@ end
 sshdev_cmd('SSHdevConnect', 'sshdev: connect to a remote workspace (! resyncs and restarts)', function(parsed)
   local Session = require('sshdev.session')
   if parsed.dest == nil then
-    return Session.pick({ force = parsed.force })
+    return Session.pick({ force = parsed.force, cfg = parsed.cfg })
   end
   Session.connect(parsed)
 end, { bang = true })
@@ -227,7 +258,7 @@ sshdev_cmd('SSHdevHistory', 'sshdev: pick a remembered remote workspace', functi
   if parsed.workspace then
     return report('expected at most one argument: [destination]')
   end
-  require('sshdev.session').pick_history({ dest = parsed.dest })
+  require('sshdev.session').pick_history({ dest = parsed.dest, cfg = parsed.cfg })
 end)
 
 ---`:SSHdevProfiles [dest]` — list reusable nvim profiles on the remote.

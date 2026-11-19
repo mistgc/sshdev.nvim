@@ -42,6 +42,8 @@ end
 ---   cmd      string[]  argv (no shell involved)
 ---   cwd      string?   working directory
 ---   input    string?   written to stdin, then stdin is closed
+---   env      table?    extra environment variables for the job, merged on
+---                      top of the inherited environment (askpass auth)
 ---   timeout  number?   milliseconds; job is killed on expiry
 ---   detach   boolean?   detach job from nvim (survives :connect detaching
 ---                      and even nvim exiting -- used by the ssh tunnel)
@@ -70,6 +72,7 @@ function M.await(opts)
   local job_opts = {
     cwd = opts.cwd,
     detach = opts.detach,
+    env = opts.env,
     on_stdout = function(_, data)
       for _, l in ipairs(data) do
         if l ~= '' then

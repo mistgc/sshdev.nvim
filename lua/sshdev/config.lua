@@ -65,6 +65,15 @@ M.defaults = {
   ---e.g. { "-i", "~/.ssh/id_ed25519", "-o", "Compression=yes" }.
   ssh_args = {},
 
+  ---How ssh authentication proceeds:
+  ---  "auto"      default: keys / ssh-agent; sshdev never prompts for a
+  ---              password (the remote must accept non-interactive auth)
+  ---  "password"  ask once per destination (|inputsecret()|, in-memory
+  ---              only, never written to disk) and feed it to every
+  ---              ssh/scp/tunnel call through SSH_ASKPASS
+  ---              (client >= 8.4; Windows inbox >= 8.6)
+  auth = 'auto',
+
   ---Remote root for all sshdev state:
   ---  <root>/nvim-bins/<version>/             nvim releases (shared)
   ---  <root>/nvim-profiles/<key>/             reusable config + plugins
@@ -260,6 +269,9 @@ function M.validate(cfg)
   end
   if not is_list_of_strings(cfg.ssh_args) then
     return 'setup: "ssh_args" must be a list of strings'
+  end
+  if not vim.tbl_contains({ 'auto', 'password' }, cfg.auth) then
+    return 'setup: "auth" must be one of "auto", "password"'
   end
   if type(cfg.remote_root) ~= 'string' or cfg.remote_root == '' then
     return 'setup: "remote_root" must be a non-empty path'

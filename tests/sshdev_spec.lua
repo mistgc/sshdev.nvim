@@ -15,6 +15,7 @@ local Bootstrap = require('sshdev.bootstrap')
 local History = require('sshdev.history')
 local Picker = require('sshdev.picker')
 local Session = require('sshdev.session')
+local Auth = require('sshdev.auth')
 
 local T = require('tests.harness')
 local eq, ok, not_ok = T.eq, T.ok, T.not_ok
@@ -296,6 +297,7 @@ T.describe('config validation: rejects', function()
     { { timeouts = { ssh = 0 } }, 'zero timeout' },
     { { timeouts = { lock = 0 } }, 'zero lock timeout' },
     { { attach = 'bogus' }, 'bad attach' },
+    { { auth = 'bogus' }, 'bad auth' },
     { { history_limit = 0 }, 'bad history_limit' },
     { { session = 'yes' }, 'session type' },
   }
@@ -314,6 +316,77 @@ T.describe('config.get falls back to defaults', function()
   eq(cfg.nvim_version, 'auto')
   eq(cfg.session, true)
   eq(cfg.workspace_profile, nil)
+end)
+
+---------------------------------------------------------------- auth
+
+T.describe('config.auth', function()
+  local cfg, err = Config.build({})
+  eq(err, nil, 'default config validates')
+  eq(cfg.auth, 'auto', 'auth defaults to "auto"')
+  local pcfg, perr = Config.build({ auth = 'password' })
+  eq(perr, nil, 'auth="password" validates')
+  eq(pcfg.auth, 'password')
+end)
+
+T.describe('auth.env: askpass overlay (no prompting)', function()
+  local parsed = Util.parse_dest('root@10.20.30.40:23')
+  local key = Util.format_dest(parsed)
+  local auto_cfg = Config.build({})
+  local pass_cfg = Config.build({ auth = 'password' })
+
+  eq(Auth.env(auto_cfg, parsed), nil, 'auth="auto" never injects askpass variables')
+
+  Auth.forget(key)
+  eq(Auth.cached(parsed), nil, 'cache starts empty')
+  eq(Auth.env(pass_cfg, parsed, { no_prompt = true }), nil,
+    'no_prompt uses the cache only and stays silent')
+
+  Auth._cache_set(key, 'top-secret-pass')
+  local env = Auth.env(pass_cfg, parsed, { no_prompt = true })
+  ok(type(env) == 'table', 'password mode returns an env overlay')
+  if env then
+    eq(env.SSHDEV_PASS, 'top-secret-pass', 'the password travels via SSHDEV_PASS')
+    eq(env.SSH_ASKPASS_REQUIRE, 'force', 'SSH_ASKPASS_REQUIRE=force')
+    ok(type(env.SSH_ASKPASS) == 'string' and #env.SSH_ASKPASS > 0, 'SSH_ASKPASS points at the helper')
+    eq(Auth.cached(parsed), 'top-secret-pass', 'cached() reads back the same key')
+
+    -- the helper is a static script: it must exist but hold NO secret
+    ok(uv.fs_stat(env.SSH_ASKPASS), 'helper file exists')
+    local fd = assert(uv.fs_open(env.SSH_ASKPASS, 'r', 438), 'helper readable')
+    local st = uv.fs_fstat(fd)
+    local content = uv.fs_read(fd, st.size, 0) or ''
+    uv.fs_close(fd)
+    ok(content:find('SSHDEV_PASS', 1, true), 'helper prints $SSHDEV_PASS')
+    not_ok(content:find('top%-secret%-pass'), 'the password is NOT written into the helper file')
+    if vim.fn.has('win32') == 1 then
+      ok(content:find('enabledelayedexpansion'), 'Windows helper uses cmd delayed expansion')
+      ok(content:find('enabledelayedexpansion\r\necho'), 'every Windows helper line ends in CRLF (regression)')
+    else
+      eq(vim.fn.executable(env.SSH_ASKPASS), 1, 'unix helper carries the executable bit')
+    end
+
+    -- forget clears the cache for that destination only
+    Auth._cache_set(Util.format_dest(Util.parse_dest('other@host')), 'another')
+    Auth.forget(key)
+    eq(Auth.cached(parsed), nil, 'forget drops the destination cache')
+    eq(Auth.env(pass_cfg, parsed, { no_prompt = true }), nil, 'env is nil after forget')
+    Auth.forget(Util.format_dest(Util.parse_dest('other@host')))
+  end
+end)
+
+T.describe('auth.auth_failure_in / is_auth_failure', function()
+  ok(Auth.auth_failure_in('root@h: Permission denied (publickey,password).'), 'connection-level rejection')
+  ok(Auth.auth_failure_in('Permission denied (keyboard-interactive).'), 'keyboard-interactive form')
+  not_ok(Auth.auth_failure_in('scp: /root/x: Permission denied'), 'a file permission error is not auth')
+  not_ok(Auth.auth_failure_in('Connection timed out'), 'timeouts are not auth failures')
+  not_ok(Auth.auth_failure_in(''), 'empty output')
+  not_ok(Auth.auth_failure_in(nil), 'nil output')
+  ok(Auth.is_auth_failure({ code = 255, stderr = 'root@h: Permission denied (publickey).' }),
+    'wrong password result detected')
+  not_ok(Auth.is_auth_failure({ code = 255, stderr = 'kex_exchange_identification: Connection closed' }),
+    'connection errors are not auth failures')
+  not_ok(Auth.is_auth_failure(nil), 'nil result')
 end)
 
 ---------------------------------------------------------------- keys
