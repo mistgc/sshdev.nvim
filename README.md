@@ -3,6 +3,8 @@
 Edit remote projects with **your local Neovim config**, through SSH, with a
 persistent remote server and session restore.
 
+![How sshdev.nvim works](assets/how-it-works.svg)
+
 ```
 local UI / --remote-ui client  ⇄  ssh -N -L  ⇄  remote nvim --headless --listen
 ```
@@ -235,6 +237,11 @@ or `:lua require('telescope').extensions.sshdev.connections()`.
 - Server liveness is found through `server.pid`, with a fallback to matching
   the unique `<workspace-profile>/session.lua` command line — a lost pid file
   never starts a second server on the same port.
+- The connect flowchart at the top of this README lives in
+  [assets/how-it-works.mmd](assets/how-it-works.mmd); re-render it with
+  `npx -y @mermaid-js/mermaid-cli -i assets/how-it-works.mmd -o assets/how-it-works.svg -b transparent -c assets/mermaid-render.json`
+  (the config pins the classic look and `flowchart.wrappingWidth`; pass `-p` a
+  puppeteer config with your local Chrome `executablePath`).
 
 ### Session persistence (no quit hijacking)
 
