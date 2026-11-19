@@ -43,16 +43,22 @@ local function guard_local()
   if vim.env.SSHDEV_REMOTE == '1' then
     return false, 'this nvim IS a sshdev remote server; refusing to nest sshdev sessions'
   end
-  if not Util.nvim_at_least(0, 11) then
-    return false, ('sshdev.nvim needs Neovim >= 0.11 locally (found %s): :connect/:detach are required'):format(tostring(vim.version()))
+  -- Verified against real binaries: :detach exists since 0.11, but :connect
+  -- (and --remote-ui) only since 0.12. Both ends are version-matched, so the
+  -- local version is the requirement.
+  if not Util.nvim_at_least(0, 12) then
+    return false, ('sshdev.nvim needs Neovim >= 0.12 locally (found %s): '
+      .. ':connect -- the command this plugin attaches with -- does not exist in 0.11'
+    ):format(tostring(vim.version()))
   end
   return true, nil
 end
 
----The :connect strategy additionally needs the :connect command.
+---The attach step needs the :connect command (>= 0.12).
 local function guard_connect()
   if vim.fn.exists(':connect') ~= 2 then
-    return false, 'this Neovim has no :connect command (upgrade to >= 0.11)'
+    return false, ('this Neovim has no :connect command (found %s); '
+      .. 'sshdev.nvim needs 0.12 or newer'):format(tostring(vim.version()))
   end
   return true, nil
 end
@@ -168,14 +174,16 @@ end
 
 ---Pick the attach strategy.
 ---
----Nvim parses a |:connect| address with socket_address_tcp_host_end(), so the
----address must be a bare "host:port" (a "tcp://" scheme makes the UI client's
----connect fail and exit).
----
----|:connect| really re-attaches the UI only when the TUI is a separate UI
----client process, which is the case from Nvim 0.12 on (0.12 turned the TUI
----into a UI client; on 0.11 |:connect| in a terminal is equivalent to
----|:detach|). External GUIs implement the "connect" UI event explicitly.
+---Facts (verified against real binaries, not assumed):
+---  * |:connect| is only parsed for a bare "host:port" address; a "tcp://"
+---    scheme is NOT a valid nvim server address -- the UI detaches, fails to
+---    attach and the process ends (this is what made it look like ":connect
+---    does not work in a TUI" earlier).
+---  * since Nvim 0.12, `nvim` starts a builtin UI client process plus an
+---    embedded server, and the UI client implements the "connect" UI event,
+---    so |:connect| re-attaches the terminal UI in place. (0.11 has no
+---    |:connect| command at all; it only gained |:detach|.)
+---  * external GUIs implement "connect" explicitly; headless has no UI.
 ---@param setting string  cfg.attach
 ---@param kind 'headless'|'tui'|'external'
 ---@return 'terminal'|'connect'|'command'
@@ -186,13 +194,10 @@ local function attach_strategy(setting, kind)
   if kind == 'headless' then
     return 'command'
   end
-  if kind == 'external' then
+  if vim.fn.exists(':connect') == 2 then
     return 'connect'
   end
-  local v = vim.version()
-  if v.major > 0 or v.minor >= 12 then
-    return 'connect'
-  end
+  -- no :connect available: only the separate UI-client path can attach
   return 'terminal'
 end
 
@@ -210,16 +215,6 @@ local function attach_ui(cfg, addr)
     local ok, aerr = guard_connect()
     if not ok then
       fail(aerr)
-    end
-    if kind == 'tui' and vim.version().minor < 12 and vim.version().major == 0 then
-      -- would silently detach on 0.11: use the UI-client path instead
-      Util.notify(
-        'Nvim < 0.12 cannot :connect from the builtin TUI (it would detach); '
-          .. 'attaching with --remote-ui instead',
-        vim.log.levels.WARN
-      )
-      attach_via_terminal(cfg, addr)
-      return
     end
     state.attached = true
     local cok, cerr = pcall(vim.cmd, ('connect %s'):format(addr))

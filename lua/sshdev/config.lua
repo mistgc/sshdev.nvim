@@ -70,11 +70,15 @@ M.defaults = {
   ---Globs of files to exclude from the config upload.
   excludes = { '.git', '.github' },
 
-  ---How the local UI attaches to the remote server:
-  ---  Builtin TUI -> a `nvim --server ... --remote-ui` client in a
-  ---  terminal tab (the TUI cannot re-attach itself: |:connect| there is
-  ---  equivalent to |:detach|); external GUI -> |:connect|; headless ->
-  ---  print the command.
+  ---How the local UI attaches to the remote server (needs Nvim >= 0.12,
+  ---the release that added :connect):
+  ---  "auto"      use |:connect| with the tunnel address (the builtin TUI
+  ---              is a UI client since 0.12 and re-attaches in place);
+  ---              headless falls back to "command"
+  ---  "connect"   always |:connect| ("host:port", no scheme)
+  ---  "terminal"  open a terminal tab with a separate
+  ---              `nvim --server host:port --remote-ui` UI client
+  ---  "command"   do not attach; just print the command to run
   attach = 'auto',
 
   ---Record every connection and offer a picker when :SSHdevConnect is called

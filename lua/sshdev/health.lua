@@ -9,17 +9,26 @@ function M.check()
 
   vim.health.start('sshdev.nvim')
 
-  -- 1. local nvim version: :connect / :detach landed in 0.11
-  if Util.nvim_at_least(0, 11) then
-    vim.health.ok(('Neovim %s (>= 0.11: :connect/:detach available)'):format(tostring(vim.version())))
+  -- 1. local nvim capabilities.
+  --    Verified against real binaries: :detach exists since 0.11, while
+  --    :connect (and --remote-ui) only exist since 0.12.
+  local has_connect = vim.fn.exists(':connect') == 2
+  local has_detach = vim.fn.exists(':detach') == 2
+  if Util.nvim_at_least(0, 12) then
+    vim.health.ok(('Neovim %s (>= 0.12: :connect and :detach available)'):format(tostring(vim.version())))
   else
-    vim.health.error(('Neovim %s is too old: sshdev.nvim needs 0.11+ (found :connect/:detach missing)'):format(tostring(vim.version())))
+    vim.health.error(('Neovim %s is too old: sshdev.nvim needs 0.12+ '
+      .. '(:connect was added in 0.12; 0.11 only has :detach)'):format(tostring(vim.version())))
   end
-  if vim.fn.exists(':connect') == 2 and vim.fn.exists(':detach') == 2 then
-    vim.health.ok(':connect and :detach commands are available')
-  else
-    vim.health.error(':connect/:detach are missing from this Neovim build')
-  end
+  vim.health.info((':connect: %s   :detach: %s'):format(
+    has_connect and 'yes' or 'no',
+    has_detach and 'yes' or 'no'
+  ))
+  local Session = require('sshdev.session')
+  vim.health.info(('current UI: %s -> attach strategy: %s'):format(
+    Session.ui_kind(),
+    Session.attach_strategy(Config.get().attach, Session.ui_kind())
+  ))
 
   -- 2. local tools
   local cfg = Config.get()

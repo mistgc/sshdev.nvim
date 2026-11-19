@@ -44,7 +44,8 @@ MIT licensed.
 
 ## Requirements
 
-- **Local**: Neovim ≥ 0.11, `ssh` and `scp` (OpenSSH ≥ 7.6).
+- **Local**: Neovim ≥ **0.12** (`:connect` was added in 0.12 — 0.11 only has
+  `:detach`), `ssh` and `scp` (OpenSSH ≥ 7.6).
 - **Remote** (Linux/macOS): `sh`, `tar`, `curl`, `sshd` allowing TCP
   forwarding.
 - Key-based authentication is strongly recommended.
@@ -145,30 +146,39 @@ the picker forgets an entry.
 Disable with `session = false`; start clean while still saving with
 `restore_session = false`.
 
-### Attaching: `--remote-ui`, not just `:connect`
+### Attaching: the local UI `:connect`s to the remote server
 
-`:connect` only re-attaches when the current **UI** implements the
-`"connect"` UI event. The builtin TUI does not — per `:help :connect`,
-"if the current UI hasn't implemented the connect UI event, this command is
-equivalent to :detach". On a terminal, `:connect` therefore drops you back
-to the shell instead of attaching.
+Since Nvim 0.12, `nvim` starts a builtin **UI client** process plus an
+embedded server, and that UI client implements the `"connect"` UI event — so
+`:connect` re-attaches the terminal UI **in place**, exactly as intended:
 
-So sshdev.nvim attaches with the documented TUI mechanism, a separate UI
-client process over the tunnel:
+```vim
+:connect 127.0.0.1:<port>     " bare host:port -- no scheme!
+```
+
+Address format matters: nvim parses a bare `host:port` (or the `ssh://…`
+built-in remote-ssh form). A `tcp://host:port` URI is **not** valid — the UI
+detaches first, then fails to attach, and the process ends, which looks like
+":connect is unsupported".
+
+`attach = 'auto'` picks a strategy:
+
+| UI | strategy | what happens |
+| --- | --- | --- |
+| builtin TUI / external GUI | `connect` | UI re-attaches in place with `:connect host:port` |
+| headless | `command` | just prints the command to run |
+
+`attach = 'terminal'` is still available as an explicit alternative: it opens
+a terminal tab with a separate UI client
 
 ```sh
 nvim --server 127.0.0.1:<port> --remote-ui
 ```
 
-`attach = 'auto'` picks the strategy per UI:
+which keeps your local nvim alive (useful when you want the local session
+back after quitting the remote one).
 
-| UI | strategy | what happens |
-| --- | --- | --- |
-| builtin TUI | `terminal` | opens a terminal tab running the `--remote-ui` client; quitting the remote returns to the local nvim |
-| external GUI (nvim-qt, Neovide, …) | `connect` | uses `:connect tcp://…` (these UIs implement the connect event) |
-| headless | `command` | just prints the command to run |
-
-Override with `attach = 'terminal' | 'connect' | 'command'`.
+Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
 
 ## Configuration
 
@@ -220,10 +230,16 @@ Notes:
 It was replaced by session persistence: `:q` quits normally, and the server
 writes `session.vim` on the way out; reconnecting restores it.
 
-**Why does the local nvim open a terminal tab?**
-The builtin TUI cannot re-attach itself to another server (`:connect` there
-is equivalent to `:detach`). A `--remote-ui` client in a terminal tab is the
-documented way to show a remote server in a terminal.
+**Does `:connect` work in the builtin TUI?**
+Yes — since Nvim 0.12 the builtin UI is a UI client process and implements the
+`connect` UI event, so `:connect host:port` re-attaches the terminal UI in
+place. (It only looks broken if you pass a scheme like `tcp://host:port`:
+that is not a valid nvim server address and leaves the UI detached.)
+
+**When would I use `attach = 'terminal'`?**
+When you want to keep your local nvim alive while working remotely: it opens a
+separate `nvim --server … --remote-ui` client in a terminal tab, so quitting
+the remote session returns you to the local one.
 
 **Why upload the whole config instead of plugin specs?**
 You want the remote session to behave exactly like home. The upload skips

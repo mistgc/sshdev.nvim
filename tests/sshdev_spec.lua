@@ -436,6 +436,42 @@ T.describe('session.ui_kind', function()
   eq(Session.ui_kind(), 'headless', 'tests run headless')
 end)
 
+T.describe('attach strategy matrix', function()
+  local Session = require('sshdev.session')
+  -- headless can never attach: report the command instead
+  eq(Session.attach_strategy('auto', 'headless'), 'command')
+  -- explicit settings win
+  eq(Session.attach_strategy('terminal', 'headless'), 'terminal')
+  eq(Session.attach_strategy('connect', 'external'), 'connect')
+  eq(Session.attach_strategy('command', 'tui'), 'command')
+  -- with :connect available (Nvim >= 0.12, the test env) both TUI and GUI
+  -- attach in place (verified: the builtin TUI is a UI client since 0.12)
+  if vim.fn.exists(':connect') == 2 then
+    eq(Session.attach_strategy('auto', 'tui'), 'connect')
+    eq(Session.attach_strategy('auto', 'external'), 'connect')
+  else
+    eq(Session.attach_strategy('auto', 'tui'), 'terminal')
+  end
+end)
+
+T.describe('the :connect address has no scheme (regression)', function()
+  -- `:connect tcp://host:port` is invalid: nvim parses a bare "host:port".
+  -- Getting this wrong silently detaches the UI and exits the process, which
+  -- is exactly what made :connect look unsupported in a TUI.
+  local root = Util.plugin_root()
+  local f = io.open(root .. '/lua/sshdev/session.lua', 'r')
+  ok(f ~= nil)
+  if f then
+    local src = f:read('*a')
+    f:close()
+    ok(src:find("('connect %s')", 1, true) ~= nil, 'connect uses a bare host:port')
+    ok(src:find("'connect tcp://", 1, true) == nil, 'no tcp:// connect command')
+    ok(src:find('"connect tcp://', 1, true) == nil, 'no tcp:// connect command (double quotes)')
+    -- and the remote-server address we hand it is host:port
+    ok(src:find("('127.0.0.1:%d'):format(lport)", 1, true) ~= nil, 'tunnel address is host:port')
+  end
+end)
+
 T.describe('picker falls back to vim.ui.select', function()
   local Picker = require('sshdev.picker')
   local History = require('sshdev.history')
