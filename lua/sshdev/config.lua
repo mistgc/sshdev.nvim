@@ -26,7 +26,7 @@ local islist = vim.islist or vim.tbl_islist
 local M = {}
 
 M.defaults = {
-  ---Default destination "[user@]host[:port]" used by :SSHdevConnect without
+  ---Default destination "[user@]host[:port]" used by :SshDevConnect without
   ---arguments (and as a suggestion in the connection picker).
   host = nil,
 
@@ -54,7 +54,7 @@ M.defaults = {
   session = true,
 
   ---Restore session.vim when (re)starting the server. Set false to start
-  ---clean while still saving (e.g. :SSHdevConnect with a fresh session).
+  ---clean while still saving (e.g. :SshDevConnect with a fresh session).
   restore_session = true,
 
   ---ssh/scp binaries.
@@ -114,7 +114,7 @@ M.defaults = {
   ---  "command"   do not attach; just print the command to run
   attach = 'auto',
 
-  ---Record every connection and offer a picker when :SSHdevConnect is called
+  ---Record every connection and offer a picker when :SshDevConnect is called
   ---without arguments (telescope when available, vim.ui.select otherwise).
   history = true,
 

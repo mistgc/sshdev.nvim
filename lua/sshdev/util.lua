@@ -462,7 +462,7 @@ end
 ---Accepts format-string arguments.
 ---
 ---Safe to call from job/libuv callbacks (fast event context): the buffer
----write is best-effort. Every line is also kept in memory, and :SSHdevLog
+---write is best-effort. Every line is also kept in memory, and :SshDevLog
 ---rebuilds the whole buffer from memory, so a skipped append is harmless.
 function M.log(msg, ...)
   if select('#', ...) > 0 then
@@ -513,7 +513,7 @@ end
 ---
 ---Long-lived flows report progress through this instead of M.notify():
 ---a history message that wraps forces a "Press ENTER" prompt and stalls
----the UI in a terminal. Details still land in the :SSHdevLog buffer.
+---the UI in a terminal. Details still land in the :SshDevLog buffer.
 function M.status(msg)
   local function show()
     pcall(vim.api.nvim_echo, { { '[sshdev] ' .. msg, 'None' } }, false, {})

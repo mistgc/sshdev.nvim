@@ -53,7 +53,7 @@ function M.check()
       )
     )
   else
-    vim.health.info('no destination configured yet: :SSHdevConnect opens the picker, or set setup({ host = "user@host" })')
+    vim.health.info('no destination configured yet: :SshDevConnect opens the picker, or set setup({ host = "user@host" })')
   end
   if cfg.proxy then
     vim.health.ok(('download proxy: %s (applies to nvim downloads ON THE REMOTE)'):format(cfg.proxy))
@@ -140,7 +140,7 @@ function M.check()
           vim.health.ok(('ssh %s works'):format(parsed.dest))
         else
           local hint = (Auth.allows_password(cfg) and Auth.auth_failure_in(sysres.stderr))
-              and ' (the host needs a password; run :SSHdevConnect once to cache it)'
+              and ' (the host needs a password; run :SshDevConnect once to cache it)'
               or ''
           vim.health.error(('ssh %s failed (exit %s): %s%s'):format(
             parsed.dest,

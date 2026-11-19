@@ -14,9 +14,9 @@ end
 ---argument shape.
 ---
 ---Flags may appear anywhere; at most two positional arguments remain:
----  :SSHdevConnect me@host ~/src/app --nvim-profile=--me-v0.12.6-1a2b3c4d--
----  :SSHdevConnect --nvim-profile --me-v0.12.6-1a2b3c4d-- me@host ~/src/app
----  :SSHdevConnect me@host ~/src/app --auth=password
+---  :SshDevConnect me@host ~/src/app --nvim-profile=--me-v0.12.6-1a2b3c4d--
+---  :SshDevConnect --nvim-profile --me-v0.12.6-1a2b3c4d-- me@host ~/src/app
+---  :SshDevConnect me@host ~/src/app --auth=password
 ---@param o table user command args
 ---@return table|nil opts
 ---@return string|nil err
@@ -237,8 +237,8 @@ local function session_fn(name)
   end
 end
 
----`:SSHdevConnect` with no arguments opens the connection picker.
-sshdev_cmd('SSHdevConnect', 'sshdev: connect to a remote workspace (! resyncs and restarts)', function(parsed)
+---`:SshDevConnect` with no arguments opens the connection picker.
+sshdev_cmd('SshDevConnect', 'sshdev: connect to a remote workspace (! resyncs and restarts)', function(parsed)
   local Session = require('sshdev.session')
   if parsed.dest == nil then
     return Session.pick({ force = parsed.force, cfg = parsed.cfg })
@@ -246,33 +246,33 @@ sshdev_cmd('SSHdevConnect', 'sshdev: connect to a remote workspace (! resyncs an
   Session.connect(parsed)
 end, { bang = true })
 
-sshdev_cmd('SSHdevAttach', 'sshdev: attach to an already-running remote server', function(parsed)
+sshdev_cmd('SshDevAttach', 'sshdev: attach to an already-running remote server', function(parsed)
   parsed.reuse_only = true
   require('sshdev.session').connect(parsed)
 end)
 
-sshdev_cmd('SSHdevInstall', 'sshdev: bootstrap nvim + config + plugins on the remote', session_fn('install'))
-sshdev_cmd('SSHdevSync', 'sshdev: re-upload config + reinstall plugins into the nvim profile', session_fn('sync'))
-sshdev_cmd('SSHdevStop', 'sshdev: stop the remote server (saves the session)', session_fn('stop'))
-sshdev_cmd('SSHdevStatus', 'sshdev: show session, profiles, tunnel and remote server state', session_fn('status'))
+sshdev_cmd('SshDevInstall', 'sshdev: bootstrap nvim + config + plugins on the remote', session_fn('install'))
+sshdev_cmd('SshDevSync', 'sshdev: re-upload config + reinstall plugins into the nvim profile', session_fn('sync'))
+sshdev_cmd('SshDevStop', 'sshdev: stop the remote server (saves the session)', session_fn('stop'))
+sshdev_cmd('SshDevStatus', 'sshdev: show session, profiles, tunnel and remote server state', session_fn('status'))
 
----`:SSHdevHistory [dest]` — picker only (never bootstraps on its own).
-sshdev_cmd('SSHdevHistory', 'sshdev: pick a remembered remote workspace', function(parsed)
+---`:SshDevHistory [dest]` — picker only (never bootstraps on its own).
+sshdev_cmd('SshDevHistory', 'sshdev: pick a remembered remote workspace', function(parsed)
   if parsed.workspace then
     return report('expected at most one argument: [destination]')
   end
   require('sshdev.session').pick_history({ dest = parsed.dest, cfg = parsed.cfg })
 end)
 
----`:SSHdevProfiles [dest]` — list reusable nvim profiles on the remote.
-sshdev_cmd('SSHdevProfiles', 'sshdev: list reusable nvim profiles on the remote', function(parsed)
+---`:SshDevProfiles [dest]` — list reusable nvim profiles on the remote.
+sshdev_cmd('SshDevProfiles', 'sshdev: list reusable nvim profiles on the remote', function(parsed)
   if parsed.workspace then
     return report('expected at most one argument: [destination]')
   end
   require('sshdev.session').profiles({ dest = parsed.dest })
 end)
 
-vim.api.nvim_create_user_command('SSHdevLog', function()
+vim.api.nvim_create_user_command('SshDevLog', function()
   require('sshdev.util').open_log()
 end, { desc = 'sshdev: open the log' })
 

@@ -14,7 +14,7 @@
 --
 -- Responsibilities (deliberately minimal -- there is NO quit hijacking):
 --   1. restore session.vim when the server (re)starts, if configured
---   2. save session.vim when the server exits, so the next :SSHdevConnect
+--   2. save session.vim when the server exits, so the next :SshDevConnect
 --      brings the user back to the same buffers/windows/layout
 --   3. re-establish FileType on the restored buffers: session sourcing
 --      reads them with the ordinary read events suppressed (no

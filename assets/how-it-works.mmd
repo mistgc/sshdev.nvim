@@ -1,5 +1,5 @@
 flowchart TD
-    Start([":SSHdevConnect me@host ~/src/app"]) --> Setup{"nvim profile installed<br/>on the remote?"}
+    Start([":SshDevConnect me@host ~/src/app"]) --> Setup{"nvim profile installed<br/>on the remote?"}
     Setup -->|"no — upload your config<br/>+ install plugins (once)"| Srv["start a detached remote server<br/>(nvim --headless --listen, restores session.vim)"]
     Setup -->|"yes — reused as-is"| Srv
     Srv --> Tunnel["ssh -N -L port forward"]

@@ -123,7 +123,7 @@ local function report_after_ui_exit(cfg, code)
   local info = state.info
   if not info then
     if code ~= 0 then
-      Util.notify(('the remote UI exited with code %d (:SSHdevAttach to retry)'):format(code), vim.log.levels.WARN)
+      Util.notify(('the remote UI exited with code %d (:SshDevAttach to retry)'):format(code), vim.log.levels.WARN)
     end
     return
   end
@@ -137,14 +137,14 @@ local function report_after_ui_exit(cfg, code)
       nvim_profile = info.nvim_profile,
     })
     if st and st.running then
-      Util.notify('detached — the remote server keeps running (:SSHdevAttach)')
+      Util.notify('detached — the remote server keeps running (:SshDevAttach)')
       return
     end
     state.info = nil
     Util.notify(
       ('remote server for "%s" stopped%s'):format(
         info.workspace,
-        st and st.has_session and ' (session saved; :SSHdevConnect restores it)' or ''
+        st and st.has_session and ' (session saved; :SshDevConnect restores it)' or ''
       )
     )
   end)
@@ -312,7 +312,7 @@ local function run_attach(cfg, parsed, layout, rport)
       state.tunnel = nil
     end
     fail(('the remote nvim server did not answer through the tunnel at 127.0.0.1:%d '
-      .. 'after %ds.\n%s/server.log on the remote and :SSHdevLog may help.\n%s'):format(
+      .. 'after %ds.\n%s/server.log on the remote and :SshDevLog may help.\n%s'):format(
       lport,
       cfg.timeouts.attach,
       layout.workspace_profile,
@@ -537,7 +537,7 @@ end
 -- Public flows
 -----------------------------------------------------------------------
 
----`:SSHdevConnect[!] [dest] [workspace]` — full pipeline or fast re-attach.
+---`:SshDevConnect[!] [dest] [workspace]` — full pipeline or fast re-attach.
 ---@param opts table { dest?, workspace?, force?, reuse_only?, nvim_profile?, cfg? }
 function M.connect(opts)
   opts = opts or {}
@@ -574,12 +574,12 @@ function M.connect(opts)
         end
         local rport = tonumber((info.addr or ''):match(':(%d+)$'))
         if not rport then
-          fail('the remote server is running but its listen address is unknown; run :SSHdevConnect! to restart it')
+          fail('the remote server is running but its listen address is unknown; run :SshDevConnect! to restart it')
         end
         return run_attach(cfg, parsed, layout, rport)
       end
     elseif opts.reuse_only then
-      fail('no remote server is running for this workspace; use :SSHdevConnect')
+      fail('no remote server is running for this workspace; use :SshDevConnect')
     end
 
     local bootstrap_needed = (not reuse_only_profile) and M.needs_bootstrap(info, layout, opts)
@@ -651,7 +651,7 @@ function M.connect(opts)
   end)
 end
 
----`:SSHdevInstall [dest] [workspace]` — bootstrap only, no server/attach.
+---`:SshDevInstall [dest] [workspace]` — bootstrap only, no server/attach.
 function M.install(opts)
   opts = opts or {}
   Proc.launch(function()
@@ -696,12 +696,12 @@ function M.install(opts)
     end
 
     Util.notify(
-      ('nvim profile "%s" is ready — :SSHdevConnect to start a server'):format(layout.nvim_profile_key)
+      ('nvim profile "%s" is ready — :SshDevConnect to start a server'):format(layout.nvim_profile_key)
     )
   end)
 end
 
----`:SSHdevSync [dest] [workspace]` — re-upload config + helper (and reinstall).
+---`:SshDevSync [dest] [workspace]` — re-upload config + helper (and reinstall).
 function M.sync(opts)
   opts = opts or {}
   Proc.launch(function()
@@ -750,7 +750,7 @@ function M.sync(opts)
       fail(cerr)
     end
     Util.notify(
-      ('synced nvim profile "%s" (%s) — use :SSHdevConnect! to restart the server'):format(
+      ('synced nvim profile "%s" (%s) — use :SshDevConnect! to restart the server'):format(
         layout.nvim_profile_key,
         layout.nvim_profile
       )
@@ -758,7 +758,7 @@ function M.sync(opts)
   end)
 end
 
----`:SSHdevStop` — stop the remote server (saves session.vim) + tunnel.
+---`:SshDevStop` — stop the remote server (saves session.vim) + tunnel.
 function M.stop()
   Proc.launch(function()
     local cfg = Config.get()
@@ -783,7 +783,7 @@ function M.stop()
   end)
 end
 
----Auto nvim profile key for the current local config (for :SSHdevStatus/health).
+---Auto nvim profile key for the current local config (for :SshDevStatus/health).
 ---@param cfg table
 ---@return string? key
 ---@return string? err
@@ -798,7 +798,7 @@ function M.auto_nvim_profile_key(cfg)
   return Keys.nvim_profile_key(Util.os_hostname(), version, hash8)
 end
 
----`:SSHdevStatus` — session, tunnel, profiles, remote server, history.
+---`:SshDevStatus` — session, tunnel, profiles, remote server, history.
 function M.status()
   Proc.launch(function()
     local cfg = Config.get()
@@ -843,7 +843,7 @@ function M.status()
 
     local entries = History.list()
     if #entries > 0 then
-      lines[#lines + 1] = ('remembered workspaces: %d (:SSHdevHistory to pick one)'):format(#entries)
+      lines[#lines + 1] = ('remembered workspaces: %d (:SshDevHistory to pick one)'):format(#entries)
     end
 
     for _, l in ipairs(lines) do
@@ -878,7 +878,7 @@ function M.profiles(opts)
       ('nvim profiles on %s (client host %s):'):format(Util.format_dest(parsed), Util.os_hostname()),
     }
     if #list == 0 then
-      lines[#lines + 1] = '  (none yet — :SSHdevConnect installs one)'
+      lines[#lines + 1] = '  (none yet — :SshDevConnect installs one)'
     end
     for _, p in ipairs(list) do
       local used = ''
@@ -893,7 +893,7 @@ function M.profiles(opts)
       )
     end
     lines[#lines + 1] = ''
-    lines[#lines + 1] = 'reuse one with: :SSHdevConnect <dest> <workspace> --nvim-profile=<key>'
+    lines[#lines + 1] = 'reuse one with: :SshDevConnect <dest> <workspace> --nvim-profile=<key>'
     for _, l in ipairs(lines) do
       Util.log('%s', l)
     end
@@ -901,7 +901,7 @@ function M.profiles(opts)
   end)
 end
 
----Open the connection picker (`:SSHdevConnect` with no arguments).
+---Open the connection picker (`:SshDevConnect` with no arguments).
 ---@param opts table|nil
 function M.pick(opts)
   opts = opts or {}
@@ -924,7 +924,7 @@ function M.pick(opts)
   end)
 end
 
----Open the workspace history picker (`:SSHdevHistory`): scans the remote
+---Open the workspace history picker (`:SshDevHistory`): scans the remote
 ---workspace profiles of this client host (user isolation) and reuses their
 ---nvim profile key.
 ---@param opts table|nil { dest = string }

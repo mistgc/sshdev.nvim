@@ -60,8 +60,8 @@ handled automatically (key first, password fallback — OpenSSH client
 ==============================================================================
 COMMANDS						*sshdev-commands*
 
-*:SSHdevConnect*
-:SSHdevConnect[!] [{dest}] [{workspace}] [--nvim-profile={key}] [--auth={mode}]
+*:SshDevConnect*
+:SshDevConnect[!] [{dest}] [{workspace}] [--nvim-profile={key}] [--auth={mode}]
 	Connect (bootstrap + attach).
 	Without arguments, opens the connection picker (telescope when
 	installed, |vim.ui.select()| otherwise) with the remembered
@@ -80,43 +80,43 @@ COMMANDS						*sshdev-commands*
 	With !, a running server is stopped and the config/plugins are
 	reinstalled into this config's own (auto) nvim profile.
 
-*:SSHdevAttach*
-:SSHdevAttach [{dest}] [{workspace}]	Attach to a RUNNING server (no
+*:SshDevAttach*
+:SshDevAttach [{dest}] [{workspace}]	Attach to a RUNNING server (no
 	bootstrap). Fails if no server is running for the workspace profile.
 
-*:SSHdevInstall*
-:SSHdevInstall [{dest}] [{workspace}] [--nvim-profile={key}]
+*:SshDevInstall*
+:SshDevInstall [{dest}] [{workspace}] [--nvim-profile={key}]
 	Bootstrap only: binary, nvim profile (config + plugins), workspace
 	profile. Does not start or attach.
 
-*:SSHdevSync*
-:SSHdevSync [{dest}] [{workspace}]	Re-upload the config and reinstall the
-	plugins into this config's own nvim profile. Use :SSHdevConnect! to
+*:SshDevSync*
+:SshDevSync [{dest}] [{workspace}]	Re-upload the config and reinstall the
+	plugins into this config's own nvim profile. Use :SshDevConnect! to
 	restart the server with the new config. Never overwrites an
 	explicitly reused profile (the auto profile is synced instead).
 
-*:SSHdevStop*
-:SSHdevStop			Stop the remote server (SIGTERM, so it saves
+*:SshDevStop*
+:SshDevStop			Stop the remote server (SIGTERM, so it saves
 	session.vim) and kill the local tunnel.
 
-*:SSHdevStatus*
-:SSHdevStatus			Report local host, auto nvim profile key,
+*:SshDevStatus*
+:SshDevStatus			Report local host, auto nvim profile key,
 	active session, workspace/nvim profiles, tunnel, remote server and
 	saved-session state.
 
-*:SSHdevHistory* *sshdev-history*
-:SSHdevHistory [{dest}]		Open the workspace picker: scans the remote
+*:SshDevHistory* *sshdev-history*
+:SshDevHistory [{dest}]		Open the workspace picker: scans the remote
 	`workspace-profiles` whose `client-host` equals this machine's local
 	hostname (user isolation), merges the local history and reconnects to
 	the selected workspace using its recorded nvim profile key.
 
-*:SSHdevProfiles*
-:SSHdevProfiles [{dest}]	List the reusable nvim profiles that exist on
+*:SshDevProfiles*
+:SshDevProfiles [{dest}]	List the reusable nvim profiles that exist on
 	the remote for this client host: key, nvim version, ready state and
 	the number of workspace profiles referencing them.
 
-*:SSHdevLog*
-:SSHdevLog			Open the sshdev log buffer.
+*:SshDevLog*
+:SshDevLog			Open the sshdev log buffer.
 
 Telescope (optional): >
 
@@ -139,14 +139,14 @@ REUSING AN NVIM PROFILE					*sshdev-reuse*
 To reuse a profile installed from another config state (e.g. pin a project to
 the plugins it was created with), pass its key: >
 
-	:SSHdevProfiles me@myhost
-	:SSHdevConnect me@myhost ~/src/second --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+	:SshDevProfiles me@myhost
+	:SshDevConnect me@myhost ~/src/second --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
 <
 The reused profile is immutable: sshdev never uploads the current config into
 it. If the key does not exist or never finished installing, sshdev warns and
 falls back to the auto profile.
 
-`:SSHdevConnect` without arguments offers the same choice interactively after
+`:SshDevConnect` without arguments offers the same choice interactively after
 you typed the destination and workspace.
 
 ==============================================================================
@@ -155,7 +155,7 @@ SESSION PERSISTENCE					*sshdev-session*
 The remote server saves its Neovim session to
 `<workspace-profile>/session.vim`:
 
-	* on VimLeavePre (:q, :wq, :cquit, SIGTERM from :SSHdevStop, ...)
+	* on VimLeavePre (:q, :wq, :cquit, SIGTERM from :SshDevStop, ...)
 	* on FocusLost / VimSuspend (best-effort snapshot)
 
 and restores it on the next start (VimEnter), so reconnecting brings back
@@ -220,10 +220,10 @@ Explicit modes: >
 	  -- auth = 'key',   -- strictly non-interactive: never prompt
 	})
 <	or per invocation (--auth=auto / --auth=password / --auth=key;
-also works for :SSHdevAttach, :SSHdevInstall, :SSHdevSync and the
+also works for :SshDevAttach, :SshDevInstall, :SshDevSync and the
 pickers): >
 
-	:SSHdevConnect me@myhost:2222 ~/src/app --auth=password
+	:SshDevConnect me@myhost:2222 ~/src/app --auth=password
 <
 Once a password is in play, every ssh/scp/tunnel spawn receives: >
 
@@ -235,7 +235,7 @@ detached `ssh -N -L` tunnel. The helper script is STATIC: it prints
 $SSHDEV_PASS and contains no secret, so it may live in the cache dir.
 
 A rejected password ("Permission denied (publickey,password)") drops the
-cached entry, so the next :SSHdevConnect prompts again.
+cached entry, so the next :SshDevConnect prompts again.
 
 Requirements / caveats:
 	* The first attempt of the "auto" mode (and every "key" mode call)
@@ -337,9 +337,9 @@ Setup with defaults (all keys optional): >
 	})
 
 host / remotes ~
-	`host` is used when :SSHdevConnect is called without arguments.
+	`host` is used when :SshDevConnect is called without arguments.
 	`remotes` maps names to destinations; its keys complete for
-	:SSHdevConnect.
+	:SshDevConnect.
 
 workspace ~
 	The remote project directory. Absolute or "~/...". The remote nvim
@@ -401,12 +401,12 @@ timeouts ~
 ==============================================================================
 TROUBLESHOOTING					*sshdev-troubleshooting*
 
-:SSHdevLog shows scp/ssh output, plugin install output and tunnel messages;
+:SshDevLog shows scp/ssh output, plugin install output and tunnel messages;
 the remote server log is `<workspace-profile>/server.log`.
 
 - "ssh connection failed" -- check key auth works: `ssh <dest> true`.
 - "the password was rejected" (password mode or the auto fallback) -- the
-  cached entry was dropped automatically; run :SSHdevConnect again to
+  cached entry was dropped automatically; run :SshDevConnect again to
   re-enter it.
 - "password fallback unavailable" -- the server rejected non-interactive
   auth AND the password could not be asked (headless nvim, or the entry
@@ -418,12 +418,12 @@ the remote server log is `<workspace-profile>/server.log`.
   once per remote + config content. Subsequent workspaces reuse the profile.
 - Plugins reinstall unexpectedly -- your config content changed (or the nvim
   version, or `excludes`). The nvim profile key tells you which content it
-  belongs to; `:SSHdevProfiles` lists them.
+  belongs to; `:SshDevProfiles` lists them.
 - "another sshdev client is still bootstrapping" -- two connects used the same
   new nvim profile; the second waits up to `timeouts.lock` and then asks you to
   retry.
 - Explicit --nvim-profile fell back to auto -- that key does not exist (or is
-  incomplete) on the remote; `:SSHdevProfiles <dest>` lists usable keys.
+  incomplete) on the remote; `:SshDevProfiles <dest>` lists usable keys.
 - Session not restored -- check that the server exited normally (SIGKILL
   cannot save) and that `restore_session` is true.
 - Port collisions -- local/remote ports are deterministic per workspace

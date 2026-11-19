@@ -2,12 +2,12 @@
 ---
 --- Two different flows:
 ---
----   * `select()`          : connection picker (`:SSHdevConnect` with no
+---   * `select()`          : connection picker (`:SshDevConnect` with no
 ---                           arguments). Local history + "new connection";
 ---                           for a new connection it lists the nvim profiles
 ---                           on the remote so an existing profile can be
 ---                           reused for the new workspace.
----   * `select_history()`  : workspace picker (`:SSHdevHistory`). Scans ALL
+---   * `select_history()`  : workspace picker (`:SshDevHistory`). Scans ALL
 ---                           workspace profiles on the remote that belong to
 ---                           THIS client hostname (user isolation), merges the
 ---                           local history for recency/counts and lets the
@@ -180,7 +180,7 @@ function M.prompt_dest(cfg, on_done)
 end
 
 -----------------------------------------------------------------------
--- Connection picker (:SSHdevConnect with no arguments)
+-- Connection picker (:SshDevConnect with no arguments)
 -----------------------------------------------------------------------
 
 ---Connection list: local history entries + a "new connection" row.
@@ -324,7 +324,7 @@ function M.select(cfg, on_choice)
 end
 
 -----------------------------------------------------------------------
--- Workspace history picker (:SSHdevHistory)
+-- Workspace history picker (:SshDevHistory)
 -----------------------------------------------------------------------
 
 ---Items for the history picker: merged remote + local workspaces + "new".

@@ -42,14 +42,14 @@ function M.setup(opts)
 end
 
 ---------------------------------------------------------------------
--- Lua API (the :SSHdev* commands are defined in plugin/sshdev.lua)
+-- Lua API (the :SshDev* commands are defined in plugin/sshdev.lua)
 ---------------------------------------------------------------------
 
 local function session()
   return require('sshdev.session')
 end
 
----Connect to a remote workspace (like |:SSHdevConnect|).
+---Connect to a remote workspace (like |:SshDevConnect|).
 ---opts: { dest = "[user@]host[:port]", workspace = "remote project dir",
 ---        nvim_profile = "--<host>-<version>-<hash8>--" (reuse an existing
 ---        nvim profile), force = bool }

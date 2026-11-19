@@ -261,7 +261,7 @@ function M.prepare(cfg, parsed, layout, opts)
     local kv = Util.parse_keyvals(res.stdout)
     if kv.ERROR == 'bin-link' then
       return nil, ('nvim profile %s has no usable nvim binary (%s/nvim-bin); '
-        .. 'run :SSHdevProfiles %s to see the usable profiles'):format(
+        .. 'run :SshDevProfiles %s to see the usable profiles'):format(
         layout.nvim_profile_key,
         layout.nvim_profile,
         parsed.dest
@@ -377,10 +377,10 @@ function M.commit_profile(cfg, parsed, layout, opts)
   end
   if kv.ERROR == 'no-config' then
     return nil, ('the uploaded config for nvim profile %s is missing; '
-      .. 'run :SSHdevConnect! to retry the upload'):format(layout.nvim_profile_key)
+      .. 'run :SshDevConnect! to retry the upload'):format(layout.nvim_profile_key)
   end
   if kv.ERROR == 'install' or res.code ~= 0 then
-    return nil, ('installing plugins into nvim profile %s failed (exit %s) — see :SSHdevLog'):format(
+    return nil, ('installing plugins into nvim profile %s failed (exit %s) — see :SshDevLog'):format(
       layout.nvim_profile_key,
       res.code
     )

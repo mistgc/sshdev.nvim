@@ -493,7 +493,7 @@ printf 'SSHDEV:PID=%s\n' "$PID"
 printf 'SSHDEV:ADDR=127.0.0.1:%s\n' "$RPORT"
 ]==]
 
----Report server + profile state for :SSHdevStatus.
+---Report server + profile state for :SshDevStatus.
 M.status = [==[
 set -eu
 WS_PROFILE='{{WS_PROFILE}}'
