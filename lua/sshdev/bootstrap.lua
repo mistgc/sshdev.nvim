@@ -83,25 +83,52 @@ end
 -----------------------------------------------------------------------
 
 ---Probe the remote host. Must run in a flow.
+---
+---In "auto" auth mode a rejected non-interactive attempt falls back to
+---asking for a password once (inputsecret) and retrying here, so every
+---flow that starts with this probe (connect/install/sync/profiles/
+---pickers) gains the fallback transparently.
 ---@param cfg table
 ---@param parsed table
 ---@return table? probe { home, sys, machine }
 ---@return string? err
 function M.probe(cfg, parsed)
-  local res = Ssh.run_script(cfg, parsed, Scripts.probe, {
-    timeout = cfg.timeouts.ssh,
-    label = 'ssh',
-  })
+  local function attempt()
+    return Ssh.run_script(cfg, parsed, Scripts.probe, {
+      timeout = cfg.timeouts.ssh,
+      label = 'ssh',
+    })
+  end
+
+  local res = attempt()
+  local fallback_note = ''
+  local used_password = Auth.mode(cfg) == 'password'
+
+  -- auto mode: the server rejected key/agent auth -> ask for a password
+  -- once and retry. A cancelled prompt or a headless session keeps the
+  -- ORIGINAL ssh failure (plus a note) instead of failing on the prompt.
+  if res.code ~= 0 and Auth.wants_fallback(cfg, res) then
+    local pw, aerr = Auth.ensure(cfg, parsed)
+    if pw then
+      used_password = true
+      Util.log('non-interactive auth to %s was rejected; retrying with a password', parsed.dest)
+      res = attempt()
+    else
+      fallback_note = '\n(password fallback unavailable: ' .. tostring(aerr) .. ')'
+    end
+  end
+
   if res.code ~= 0 then
     local hint = ''
-    if Auth.enabled(cfg) and Auth.is_auth_failure(res) then
+    if used_password and Auth.is_auth_failure(res) then
       -- Ssh.run_script already dropped the cached password
       hint = '\n(the password was rejected; run the command again to re-enter it)'
     end
-    return nil, ('ssh connection to %s failed (exit %s)%s%s'):format(
+    return nil, ('ssh connection to %s failed (exit %s)%s%s%s'):format(
       parsed.dest,
       res.code,
       res.stderr ~= '' and (':\n' .. Util.tail(res.stderr, 5)) or '',
+      fallback_note,
       hint
     )
   end

@@ -66,12 +66,15 @@ M.defaults = {
   ssh_args = {},
 
   ---How ssh authentication proceeds:
-  ---  "auto"      default: keys / ssh-agent; sshdev never prompts for a
-  ---              password (the remote must accept non-interactive auth)
-  ---  "password"  ask once per destination (|inputsecret()|, in-memory
-  ---              only, never written to disk) and feed it to every
-  ---              ssh/scp/tunnel call through SSH_ASKPASS
-  ---              (client >= 8.4; Windows inbox >= 8.6)
+  ---  "auto"      default: keys / ssh-agent first, non-interactive; when
+  ---              the server rejects that, ask for a password once
+  ---              (|inputsecret()|, in-memory only) and retry. The
+  ---              password is then cached for the rest of the nvim session
+  ---  "password"  ask before the first ssh call (known password-only
+  ---              host; skips the failed non-interactive round trip)
+  ---  "key"       strictly non-interactive: never prompt or use askpass
+  ---The password fallback needs an OpenSSH client >= 8.4
+  ---(SSH_ASKPASS_REQUIRE; the Windows inbox client has it since 8.6).
   auth = 'auto',
 
   ---Remote root for all sshdev state:
@@ -270,8 +273,8 @@ function M.validate(cfg)
   if not is_list_of_strings(cfg.ssh_args) then
     return 'setup: "ssh_args" must be a list of strings'
   end
-  if not vim.tbl_contains({ 'auto', 'password' }, cfg.auth) then
-    return 'setup: "auth" must be one of "auto", "password"'
+  if not vim.tbl_contains({ 'auto', 'password', 'key' }, cfg.auth) then
+    return 'setup: "auth" must be one of "auto", "password", "key"'
   end
   if type(cfg.remote_root) ~= 'string' or cfg.remote_root == '' then
     return 'setup: "remote_root" must be a non-empty path'

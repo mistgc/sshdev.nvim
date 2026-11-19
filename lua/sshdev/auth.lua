@@ -1,26 +1,39 @@
---- Password authentication for sshdev.nvim (opt-in: setup({ auth =
---- "password" }) or the one-shot --auth=password command flag).
+--- Password authentication for sshdev.nvim.
 ---
---- How it works:
----   * the password is asked ONCE per destination with |inputsecret()| and
----     kept ONLY in this module's table for the lifetime of the local nvim
----     session -- never written to disk, history or the log;
----   * every ssh/scp/tunnel spawn in password mode receives
+--- The `auth` option (setup() or a one-shot --auth=... command flag)
+--- selects how authentication proceeds:
+---
+---   "auto" (default)
+---       keys / ssh-agent first, fully non-interactive. When the server
+---       REJECTS that, sshdev asks for a password once (|inputsecret()|),
+---       retries and keeps it for the rest of the nvim session.
+---   "password"
+---       ask before the first ssh call (known password-only host; skips
+---       the failed non-interactive round trip).
+---   "key"
+---       strictly non-interactive: never prompt or inject askpass.
+---
+--- Once a password is in play (entered in either mode), every ssh/scp/
+--- tunnel spawn receives
 ---       SSH_ASKPASS=<stdpath("cache")>/sshdev/askpass.cmd|.sh
 ---       SSH_ASKPASS_REQUIRE=force
 ---       SSHDEV_PASS=<password>
----     and OpenSSH calls the helper whenever it needs a password -- from
----     piped (no tty) processes, nvim jobstart children and detached
----     `ssh -N -L` tunnels alike (verified against Windows OpenSSH 9.5p2);
----   * the helper is a STATIC script that just prints $SSHDEV_PASS: it
----     contains no secret, so keeping it in the cache dir is harmless.
----     Clients >= 8.4 honor SSH_ASKPASS_REQUIRE; older ones get the legacy
----     DISPLAY gate as a fallback.
+--- and OpenSSH calls the helper whenever it needs a password -- from
+--- piped (no tty) processes, nvim jobstart children and detached
+--- `ssh -N -L` tunnels alike (verified on Windows OpenSSH 9.5p2). A
+--- working key keeps working: ssh tries keys first, the helper is only
+--- consulted when a password is actually needed.
 ---
---- The password therefore lives in the environment of the spawned ssh/scp
---- children (including a tunnel that outlives nvim) -- the documented,
---- accepted trade-off of this mode. Key authentication stays the default
---- ("auto") and never gets askpass variables injected.
+--- The helper is a STATIC script that just prints $SSHDEV_PASS: it
+--- contains no secret, so keeping it in the cache dir is harmless.
+--- Clients >= 8.4 honor SSH_ASKPASS_REQUIRE; older ones get the legacy
+--- DISPLAY gate as a fallback.
+---
+--- The password is asked ONCE per destination and kept ONLY in this
+--- module's table for the lifetime of the local nvim session -- never
+--- written to disk, history or the log. It therefore lives in the
+--- environment of the spawned ssh/scp children (including a tunnel that
+--- outlives nvim) -- the documented, accepted trade-off of this mode.
 
 local M = {}
 
@@ -85,14 +98,29 @@ function M.helper_path()
 end
 
 -----------------------------------------------------------------------
--- Password cache + prompting
+-- Auth mode + password cache + prompting
 -----------------------------------------------------------------------
 
----Is password auth requested for this configuration?
+---Normalized auth mode for a configuration:
+---  "auto"      key/agent first; on rejection ask for a password once
+---              and retry (the default)
+---  "password"  ask before the first ssh call (known password-only host)
+---  "key"       strictly non-interactive: never prompt or inject askpass
+---@param cfg table
+---@return string
+function M.mode(cfg)
+  local a = cfg and cfg.auth
+  if a == 'password' or a == 'key' then
+    return a
+  end
+  return 'auto'
+end
+
+---Is password authentication allowed at all for this configuration?
 ---@param cfg table
 ---@return boolean
-function M.enabled(cfg)
-  return (cfg and cfg.auth) == 'password'
+function M.allows_password(cfg)
+  return M.mode(cfg) ~= 'key'
 end
 
 ---The cached password for a destination, if any (never prompts).
@@ -138,28 +166,35 @@ function M.ensure(cfg, parsed)
   return pw
 end
 
----Env overlay for ssh/scp spawns in password mode, or nil when password
----auth is off (or, with opts.no_prompt, when nothing is cached).
+---Env overlay for ssh/scp spawns when a password is in play, or nil.
 ---
----Throws a level-0 error when the password cannot be obtained: the Ssh
----callers are flows whose error machinery reports the message, and no ssh
----process is ever started without the askpass variables.
+---  "key"                  always nil (strictly non-interactive)
+---  "auto"                 nil until a password is cached; the overlay
+---                         once one is (entered after a rejected key
+---                         attempt, see Bootstrap.probe's fallback)
+---  "password"             prompt when nothing is cached (unless
+---                         opts.no_prompt, which then yields nil)
+---
+---The "password" prompt path throws a level-0 error when the entry is
+---cancelled: the Ssh callers are flows whose error machinery reports the
+---message, and no ssh process is ever started without the askpass
+---variables. The "auto" mode never prompts here -- its prompt happens at
+---the probe fallback and can fail soft.
 ---@param cfg table
 ---@param parsed table
 ---@param opts table|nil { no_prompt = boolean }
 ---@return table? env
 function M.env(cfg, parsed, opts)
-  if not M.enabled(cfg) then
+  local mode = M.mode(cfg)
+  if mode == 'key' then
     return nil
   end
   opts = opts or {}
-  local pw
-  if opts.no_prompt then
-    pw = M.cached(parsed)
-    if not pw then
+  local pw = M.cached(parsed)
+  if not pw then
+    if mode ~= 'password' or opts.no_prompt then
       return nil
     end
-  else
     local err
     pw, err = M.ensure(cfg, parsed)
     if not pw then
@@ -201,6 +236,41 @@ end
 ---@return boolean
 function M.is_auth_failure(res)
   return res ~= nil and M.auth_failure_in(res.stderr)
+end
+
+---True when, after an ssh attempt, the "auto" auth mode should fall back
+---to asking for a password: the result looks like the server REJECTED our
+---non-interactive (key/agent) authentication. Pure (unit-testable); the
+---caller then prompts via ensure() and retries the step once.
+---@param cfg table
+---@param res table|nil await() result
+---@return boolean
+function M.wants_fallback(cfg, res)
+  return M.mode(cfg) == 'auto' and M.is_auth_failure(res)
+end
+
+---True when a spawn must be strictly non-interactive (BatchMode): the
+---auto mode has NO password cached yet, or the key mode forbids passwords
+---outright. Without this, an ssh that needs a password but has no askpass
+---and no console HANGS on the prompt until the command timeout kills it
+---(observed on Windows jobstart children: exit 143, empty stderr) instead
+---of failing fast with a "Permission denied (...)" signature.
+---
+---The state is read per spawn: once a fallback password is cached (or the
+---password mode prompted), spawns drop BatchMode and use the askpass
+---overlay instead.
+---@param cfg table
+---@param parsed table
+---@return boolean
+function M.needs_batch(cfg, parsed)
+  local mode = M.mode(cfg)
+  if mode == 'password' then
+    return false -- env() prompts (or the cache hits) before any spawn
+  end
+  if mode == 'key' then
+    return true
+  end
+  return M.cached(parsed) == nil -- auto: nothing cached -> key/agent only
 end
 
 ---Drop the cached password for a destination (authentication failed; the

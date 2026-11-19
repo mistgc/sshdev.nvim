@@ -358,10 +358,10 @@ local function prepare_probe(opts)
     return nil
   end
 
-  -- password mode: ask BEFORE the first ssh round trip, so the prompt is
-  -- the first thing the user sees (Ssh.* would prompt lazily as a
-  -- fallback for flows that do not pass through here).
-  if Auth.enabled(cfg) then
+  -- explicit password mode: ask BEFORE the first ssh round trip, so the
+  -- prompt is the first thing the user sees ("auto" does not prompt here;
+  -- its fallback lives in Bootstrap.probe, Ssh.* prompts lazily).
+  if Auth.mode(cfg) == 'password' then
     local pw, aerr = Auth.ensure(cfg, parsed)
     if not pw then
       Util.report_error(aerr)

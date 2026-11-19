@@ -68,8 +68,9 @@ MIT licensed.
   `:detach`), `ssh` and `scp` (OpenSSH ≥ 7.6).
 - **Remote** (Linux/macOS): `sh`, `tar`, `curl`, `sshd` allowing TCP
   forwarding.
-- Key-based authentication is strongly recommended. Password-only hosts
-  work with `auth = 'password'` (OpenSSH client ≥ 8.4, see
+- Key-based authentication is recommended. Hosts that only accept
+  passwords are handled automatically (key first, password fallback —
+  needs an OpenSSH client ≥ 8.4, see
   [Password authentication](#password-authentication)).
 
 ## Installing
@@ -108,7 +109,7 @@ With telescope (optional — enables the fuzzy pickers):
 :SSHdevConnect me@myhost:2222 ~/src/app
 :SSHdevConnect work                  " a destination named in setup({ remotes = ... })
 :SSHdevConnect me@myhost:2222 ~/src/app --auth=password
-                                     " ask the ssh password once and use it
+                                     " force password mode for this connection
 :SSHdevConnect me@myhost ~/src/app --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
                                      " new workspace reusing an existing nvim profile
 :SSHdevConnect!                      " restart server, re-sync into the profile
@@ -285,48 +286,64 @@ Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
 
 ## Password authentication
 
-Key/ssh-agent auth is the default (`auth = 'auto'`: no prompts, fully
-non-interactive). For hosts that only accept passwords:
+The default `auth = 'auto'` tries key/ssh-agent first, fully
+non-interactive. When the server rejects that (`Permission denied
+(publickey,…)`), sshdev asks for the password once (`inputsecret()`,
+masked), retries and keeps it **only in memory** for the rest of the nvim
+session — never on disk, in history or in the log. From then on every
+ssh/scp/tunnel call of the session authenticates through `SSH_ASKPASS`.
+A working key keeps working: ssh tries keys first, the askpass helper is
+only consulted when a password is actually needed.
+
+Explicit modes, when you want to skip the failed non-interactive round
+trip (known password-only host) or forbid prompts entirely:
 
 ```lua
 require('sshdev').setup({
   host = 'me@myhost',
-  auth = 'password',
+  auth = 'password',  -- ask BEFORE the first ssh call
+  -- auth = 'key',    -- strictly non-interactive: never prompt
 })
 ```
 
-or as a one-shot flag (also works for `:SSHdevAttach`, `:SSHdevInstall`,
-`:SSHdevSync` and the `:SSHdevConnect` picker):
+or per invocation (`auto` / `password` / `key`; also works for
+`:SSHdevAttach`, `:SSHdevInstall`, `:SSHdevSync` and the pickers):
 
 ```vim
 :SSHdevConnect me@myhost:2222 ~/src/app --auth=password
 ```
 
-How it works:
+How the password travels:
 
-- the password is requested once per destination with `inputsecret()`
-  (masked) and kept **only in memory** for the lifetime of the local nvim
-  session — never on disk, in history or in the log;
-- every ssh/scp/tunnel call then receives `SSH_ASKPASS` — a tiny helper
-  script under `stdpath('cache')/sshdev/` that prints `$SSHDEV_PASS` —
-  plus `SSH_ASKPASS_REQUIRE=force`, so OpenSSH authenticates without a
-  terminal. The helper itself contains **no secret**. Verified against
-  Windows OpenSSH 9.5, including detached `ssh -N -L` tunnel processes;
+- the first attempt of the auto mode (and every `key`-mode call) runs
+  with `BatchMode=yes` — strictly key/agent — so a password-needing host
+  fails **fast** with a `Permission denied` signature (without askpass or
+  a console, ssh would otherwise hang on the prompt until the timeout);
+- once a password is in play, every ssh/scp/tunnel call receives
+  `SSH_ASKPASS` — a tiny helper script under `stdpath('cache')/sshdev/`
+  that prints `$SSHDEV_PASS` — plus `SSH_ASKPASS_REQUIRE=force`, so
+  OpenSSH authenticates without a terminal. The helper itself contains
+  **no secret**. Verified against Windows OpenSSH 9.5, including
+  detached `ssh -N -L` tunnel processes;
 - a rejected password (`Permission denied (publickey,password)`) is
   detected and the cached entry dropped, so the next `:SSHdevConnect`
   asks again.
 
 Requirements & caveats:
 
-- OpenSSH **≥ 8.4** client (`SSH_ASKPASS_REQUIRE`; the Windows inbox client
-  has it since 8.6 — 9.5 verified). `:checkhealth sshdev` reports the
-  capability and the helper status.
-- The password is visible in the environment of the spawned ssh/scp
+- the password fallback needs an OpenSSH **≥ 8.4** client
+  (`SSH_ASKPASS_REQUIRE`; the Windows inbox client has it since 8.6 — 9.5
+  verified). `:checkhealth sshdev` reports the capability and the helper
+  status.
+- a headless nvim cannot ask for a password: the connection fails with
+  the original ssh error plus a note (run from a TUI/GUI, or use key
+  auth).
+- the password is visible in the environment of the spawned ssh/scp
   children (including a tunnel kept alive after nvim exits) — the
   accepted trade-off of this mode.
-- Single-factor passwords only: 2FA / keyboard-interactive prompts cannot
+- single-factor passwords only: 2FA / keyboard-interactive prompts cannot
   be answered (use key auth for those).
-- On Windows, a `!` in the password cannot be passed (cmd delayed
+- on Windows, a `!` in the password cannot be passed (cmd delayed
   expansion); sshdev warns when it sees one.
 
 ## Upgrading from the old single-profile layout
@@ -361,7 +378,7 @@ require('sshdev').setup({
 
   ssh_bin = 'ssh', scp_bin = 'scp',
   ssh_args = { '-i', '~/.ssh/id_ed25519' },
-  auth = 'auto',             -- "auto" (key/agent) | "password" (askpass)
+  auth = 'auto',             -- "auto" (key first, password fallback) | "password" | "key"
 
   remote_root = '~/.sshdev.nvim',
 
@@ -423,9 +440,11 @@ You want the remote session to behave exactly like home. The upload skips
 workspace with the same config.
 
 **How do I connect to a host that only accepts passwords?**
-Set `auth = 'password'` (or pass `--auth=password` once). You are prompted
-once per destination; the password stays in memory and is fed to ssh via
-`SSH_ASKPASS`. `:checkhealth sshdev` verifies your client supports it.
+Nothing to configure: the default `auth = 'auto'` detects the rejected
+non-interactive attempt, asks for the password once and retries. Set
+`auth = 'password'` to skip the failed round trip, or `--auth=password`
+for one connection. `:checkhealth sshdev` verifies your client supports
+the fallback.
 
 **How do I get rid of old nvim profiles?**
 Each config edit creates a new `nvim-profiles/--…--` directory (the old one is

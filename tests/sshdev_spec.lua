@@ -324,32 +324,42 @@ T.describe('config.auth', function()
   local cfg, err = Config.build({})
   eq(err, nil, 'default config validates')
   eq(cfg.auth, 'auto', 'auth defaults to "auto"')
-  local pcfg, perr = Config.build({ auth = 'password' })
-  eq(perr, nil, 'auth="password" validates')
-  eq(pcfg.auth, 'password')
+  for _, v in ipairs({ 'auto', 'password', 'key' }) do
+    local c, e = Config.build({ auth = v })
+    eq(e, nil, ('auth=%q validates'):format(v))
+    eq(c.auth, v)
+  end
 end)
 
-T.describe('auth.env: askpass overlay (no prompting)', function()
+T.describe('auth.mode / env matrix: when does the askpass overlay apply', function()
   local parsed = Util.parse_dest('root@10.20.30.40:23')
   local key = Util.format_dest(parsed)
   local auto_cfg = Config.build({})
   local pass_cfg = Config.build({ auth = 'password' })
+  local key_cfg = Config.build({ auth = 'key' })
 
-  eq(Auth.env(auto_cfg, parsed), nil, 'auth="auto" never injects askpass variables')
+  eq(Auth.mode(auto_cfg), 'auto', 'default mode is auto')
+  eq(Auth.mode(pass_cfg), 'password')
+  eq(Auth.mode(key_cfg), 'key')
+  eq(Auth.mode({}), 'auto', 'missing auth normalizes to auto')
 
   Auth.forget(key)
   eq(Auth.cached(parsed), nil, 'cache starts empty')
+  eq(Auth.env(auto_cfg, parsed), nil, 'auto with nothing cached injects nothing (key/agent first)')
   eq(Auth.env(pass_cfg, parsed, { no_prompt = true }), nil,
     'no_prompt uses the cache only and stays silent')
 
   Auth._cache_set(key, 'top-secret-pass')
-  local env = Auth.env(pass_cfg, parsed, { no_prompt = true })
-  ok(type(env) == 'table', 'password mode returns an env overlay')
+  local env = Auth.env(auto_cfg, parsed, { no_prompt = true })
+  ok(type(env) == 'table', 'auto WITH a cached password (after a fallback) uses the overlay')
   if env then
     eq(env.SSHDEV_PASS, 'top-secret-pass', 'the password travels via SSHDEV_PASS')
     eq(env.SSH_ASKPASS_REQUIRE, 'force', 'SSH_ASKPASS_REQUIRE=force')
     ok(type(env.SSH_ASKPASS) == 'string' and #env.SSH_ASKPASS > 0, 'SSH_ASKPASS points at the helper')
     eq(Auth.cached(parsed), 'top-secret-pass', 'cached() reads back the same key')
+    local penv = Auth.env(pass_cfg, parsed, { no_prompt = true })
+    ok(type(penv) == 'table' and penv.SSHDEV_PASS == 'top-secret-pass',
+      'password mode with a cache returns the same overlay')
 
     -- the helper is a static script: it must exist but hold NO secret
     ok(uv.fs_stat(env.SSH_ASKPASS), 'helper file exists')
@@ -366,13 +376,49 @@ T.describe('auth.env: askpass overlay (no prompting)', function()
       eq(vim.fn.executable(env.SSH_ASKPASS), 1, 'unix helper carries the executable bit')
     end
 
+    -- the strict key mode refuses the overlay even with a cache
+    eq(Auth.env(key_cfg, parsed, { no_prompt = true }), nil,
+      'key mode never injects askpass variables')
+
     -- forget clears the cache for that destination only
     Auth._cache_set(Util.format_dest(Util.parse_dest('other@host')), 'another')
     Auth.forget(key)
     eq(Auth.cached(parsed), nil, 'forget drops the destination cache')
-    eq(Auth.env(pass_cfg, parsed, { no_prompt = true }), nil, 'env is nil after forget')
+    eq(Auth.env(auto_cfg, parsed, { no_prompt = true }), nil, 'env is nil after forget')
     Auth.forget(Util.format_dest(Util.parse_dest('other@host')))
   end
+end)
+
+T.describe('auth.wants_fallback (auto retry decision)', function()
+  local auto_cfg = Config.build({})
+  local pass_cfg = Config.build({ auth = 'password' })
+  local key_cfg = Config.build({ auth = 'key' })
+  local rejected = { code = 255, stderr = 'root@h: Permission denied (publickey,password).' }
+  local refused = { code = 255, stderr = 'kex_exchange_identification: Connection closed' }
+  ok(Auth.wants_fallback(auto_cfg, rejected), 'auto + auth rejection falls back to a password')
+  not_ok(Auth.wants_fallback(pass_cfg, rejected), 'password mode prompts upfront, no probe fallback')
+  not_ok(Auth.wants_fallback(key_cfg, rejected), 'key mode never falls back')
+  not_ok(Auth.wants_fallback(auto_cfg, refused), 'non-auth failures do not fall back')
+  not_ok(Auth.wants_fallback(auto_cfg, nil), 'nil result')
+end)
+
+T.describe('auth.needs_batch (strictly non-interactive spawns)', function()
+  local parsed = Util.parse_dest('root@10.20.30.40:23')
+  local key = Util.format_dest(parsed)
+  local auto_cfg = Config.build({})
+  local pass_cfg = Config.build({ auth = 'password' })
+  local key_cfg = Config.build({ auth = 'key' })
+
+  Auth.forget(key)
+  ok(Auth.needs_batch(auto_cfg, parsed), 'auto with nothing cached stays non-interactive (BatchMode)')
+  not_ok(Auth.needs_batch(pass_cfg, parsed), 'password mode prompts through env() instead')
+
+  Auth._cache_set(key, 'pw')
+  not_ok(Auth.needs_batch(auto_cfg, parsed), 'auto with a cached password drops BatchMode (askpass)')
+  not_ok(Auth.needs_batch(pass_cfg, parsed), 'password mode with a cache drops BatchMode')
+  ok(Auth.needs_batch(key_cfg, parsed), 'key mode is always non-interactive, even with a cache')
+
+  Auth.forget(key)
 end)
 
 T.describe('auth.auth_failure_in / is_auth_failure', function()

@@ -75,10 +75,11 @@ function M.check()
   vim.health.info(('attach strategy: %s'):format(cfg.attach))
   vim.health.info(('bootstrap lock timeout: %ss'):format(cfg.timeouts.lock))
 
-  -- password-auth mode (askpass): capability + helper checks
-  if cfg.auth == 'password' then
-    local Auth = require('sshdev.auth')
-    vim.health.info('auth: password (askpass helper + in-memory cache; never written to disk)')
+  -- auth mode: askpass capability + helper checks (when a password may be used)
+  local Auth = require('sshdev.auth')
+  if Auth.allows_password(cfg) then
+    vim.health.info(('auth: %s (password fallback available; the password stays in memory, never on disk)')
+      :format(Auth.mode(cfg)))
     local vres = vim.system({ cfg.ssh_bin, '-V' }, { timeout = 5000, text = true }):wait()
     local vline = (vres.stderr or '') .. (vres.stdout or '')
     local maj, minr = vline:match('OpenSSH[_%w]*v?(%d+)%.(%d+)')
@@ -87,10 +88,10 @@ function M.check()
         vim.health.ok(('ssh client %s.%s supports SSH_ASKPASS_REQUIRE=force'):format(maj, minr))
       else
         vim.health.warn(('ssh client %s.%s predates SSH_ASKPASS_REQUIRE (>= 8.4); '
-          .. 'password auth may not work'):format(maj, minr))
+          .. 'the password fallback may not work'):format(maj, minr))
       end
     else
-      vim.health.warn('cannot determine the ssh client version (password auth needs >= 8.4)')
+      vim.health.warn('cannot determine the ssh client version (the password fallback needs >= 8.4)')
     end
     local helper, herr = Auth.helper_path()
     if helper then
@@ -99,7 +100,7 @@ function M.check()
       vim.health.error(('cannot create the askpass helper: %s'):format(tostring(herr)))
     end
   else
-    vim.health.info('auth: auto (key / ssh-agent; no password prompts)')
+    vim.health.info('auth: key (strictly non-interactive; no password prompts)')
   end
 
   local hist = require('sshdev.history').list()
@@ -112,30 +113,25 @@ function M.check()
   if dest then
     local parsed, err = Util.parse_dest(dest)
     if parsed then
-      if cfg.auth == 'password' then
-        -- BatchMode disables password auth entirely; use the cached
-        -- password (if any) through the askpass environment instead.
-        local Auth = require('sshdev.auth')
-        local env = Auth.env(cfg, parsed, { no_prompt = true })
-        if not env then
-          vim.health.info(('password auth: no cached password for %s yet -- the live ssh test '
-            .. 'is skipped (run :SSHdevConnect once to enter it)'):format(parsed.dest))
+      -- BatchMode disables password auth entirely; when a password is
+      -- cached (auto fallback or password mode) test through the askpass
+      -- environment instead.
+      local env = Auth.env(cfg, parsed, { no_prompt = true })
+      if env then
+        local sysres = vim
+          .system(
+            { cfg.ssh_bin, '-o', 'ConnectTimeout=10', '--', parsed.dest, 'true' },
+            { timeout = 15000, text = true, env = env }
+          )
+          :wait()
+        if sysres.code == 0 then
+          vim.health.ok(('ssh %s works (password auth, cached)'):format(parsed.dest))
         else
-          local sysres = vim
-            .system(
-              { cfg.ssh_bin, '-o', 'ConnectTimeout=10', '--', parsed.dest, 'true' },
-              { timeout = 15000, text = true, env = env }
-            )
-            :wait()
-          if sysres.code == 0 then
-            vim.health.ok(('ssh %s works (password auth, cached)'):format(parsed.dest))
-          else
-            vim.health.error(('ssh %s failed (exit %s): %s'):format(
-              parsed.dest,
-              sysres.code,
-              Util.tail(sysres.stderr, 3)
-            ))
-          end
+          vim.health.error(('ssh %s failed (exit %s): %s'):format(
+            parsed.dest,
+            sysres.code,
+            Util.tail(sysres.stderr, 3)
+          ))
         end
       else
         local args = { cfg.ssh_bin, '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes', '--', parsed.dest, 'true' }
@@ -143,10 +139,14 @@ function M.check()
         if sysres.code == 0 then
           vim.health.ok(('ssh %s works'):format(parsed.dest))
         else
-          vim.health.error(('ssh %s failed (exit %s): %s'):format(
+          local hint = (Auth.allows_password(cfg) and Auth.auth_failure_in(sysres.stderr))
+              and ' (the host needs a password; run :SSHdevConnect once to cache it)'
+              or ''
+          vim.health.error(('ssh %s failed (exit %s): %s%s'):format(
             parsed.dest,
             sysres.code,
-            Util.tail(sysres.stderr, 3)
+            Util.tail(sysres.stderr, 3),
+            hint
           ))
         end
       end

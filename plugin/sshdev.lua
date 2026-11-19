@@ -25,8 +25,8 @@ local function parse_args(o)
   local positional = {}
   local fargs = o.fargs or {}
   local function set_auth(v)
-    if v ~= 'password' then
-      return ('--auth currently supports only "password" (got %s)'):format(v == '' and '(empty)' or v)
+    if not vim.tbl_contains({ 'auto', 'password', 'key' }, v) then
+      return ('--auth must be one of "auto", "password", "key" (got %s)'):format(v == '' and '(empty)' or v)
     end
     -- per-call config override; Session.prepare_probe merges it over setup()
     opts.cfg = vim.tbl_deep_extend('force', opts.cfg or {}, { auth = v })
@@ -185,11 +185,14 @@ local function complete_args(arglead, cmdline, cursorpos)
     if flag:sub(1, #arglead) == arglead then
       return { flag }
     end
-    local authflag = '--auth=password'
-    if authflag:sub(1, #arglead) == arglead then
-      return { authflag }
+    local authflags = { '--auth=auto', '--auth=password', '--auth=key' }
+    local matches = {}
+    for _, f in ipairs(authflags) do
+      if f:sub(1, #arglead) == arglead then
+        matches[#matches + 1] = f
+      end
     end
-    return {}
+    return matches
   end
 
   if #positional == 0 then

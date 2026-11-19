@@ -11,7 +11,8 @@
 --- All functions take the PARSED destination table from
 --- `Util.parse_dest` (with .dest / .user / .host / .port), not a raw string.
 ---
---- In password mode (cfg.auth = "password", see sshdev.auth) every spawn
+--- When a password is in play (cfg.auth = "password", or the "auto" mode
+--- after a fallback password was entered -- see sshdev.auth) every spawn
 --- gets the askpass environment overlay via Auth.env(), so ssh/scp/tunnel
 --- authentication never needs a terminal.
 
@@ -50,6 +51,13 @@ local function base_args(cfg, parsed, bin, flagstyle)
     else
       vim.list_extend(args, { '-p', tostring(parsed.port) })
     end
+  end
+  -- strictly non-interactive when no password is in play: without this an
+  -- ssh that wants a password (no askpass, no console) HANGS until the
+  -- command timeout instead of failing fast with a Permission-denied
+  -- signature (the auto fallback relies on that fast failure).
+  if Auth.needs_batch(cfg, parsed) then
+    vim.list_extend(args, { '-o', 'BatchMode=yes' })
   end
   vim.list_extend(args, cfg.ssh_args or {})
   return args
