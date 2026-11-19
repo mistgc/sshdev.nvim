@@ -4,7 +4,7 @@
 ---
 ---   ~/.sshdev.nvim/
 ---   ├── _bin/<version>-<asset>/          nvim releases, shared by profiles
----   └── <local-hostname>-<ws-path>/      one profile per (client, workspace)
+---   └── --<local-hostname>--<ws-path>--/      one profile per (client, workspace)
 ---       ├── nvim-config/                 uploaded config (NVIM_APPNAME)
 ---       ├── data/                        XDG_DATA_HOME (plugins, shada)
 ---       ├── state/                       XDG_STATE_HOME

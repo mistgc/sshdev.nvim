@@ -266,11 +266,15 @@ function M.os_hostname()
   return M.sanitize_segment(name, 32)
 end
 
----Profile key for a remote workspace: "<local-hostname>-<workspace-path>".
+---Profile directory name for a remote workspace.
 ---
----The workspace is the remote PROJECT DIRECTORY (e.g. /home/me/src/app);
----the key is derived from the LOCAL hostname so that several client
----machines can use the same remote account without sharing state.
+---Format: "--<local-hostname>--<workspace-path>--"
+---   e.g. "--DESKTOP-ABC--home-me-src-app--"
+---
+---The workspace is the remote PROJECT DIRECTORY (e.g. /home/me/src/app), so
+---its slashes become dashes. The key is derived from the LOCAL hostname so
+---that several client machines can use the same remote account without
+---sharing state.
 ---@param local_hostname string
 ---@param workspace_abs string absolute remote path
 ---@return string
@@ -280,7 +284,7 @@ function M.profile_key(local_hostname, workspace_abs)
   -- "/home/me/src/app" -> "home-me-src-app"
   ws = ws:gsub('/+', '-'):gsub('^-+', ''):gsub('-+$', '')
   local ws_key = M.sanitize_segment(ws, 80)
-  return host .. '-' .. ws_key
+  return '--' .. host .. '--' .. ws_key .. '--'
 end
 
 local function djb2(s)

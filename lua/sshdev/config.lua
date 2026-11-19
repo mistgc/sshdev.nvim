@@ -3,7 +3,7 @@
 --- Terminology:
 ---   * workspace       -- the remote PROJECT DIRECTORY (e.g. ~/src/app)
 ---   * profile         -- remote state dir for (local host, workspace):
----                        <remote_root>/<local-hostname>-<workspace-path>/
+---                        <remote_root>/--<local-hostname>--<workspace-path>--/
 ---                        It holds the uploaded config, plugins, data,
 ---                        session.vim and logs, isolating different client
 ---                        machines that share one remote account.
@@ -28,7 +28,7 @@ M.defaults = {
   workspace = nil,
 
   ---Force the profile directory name (default:
-  ---"<local-hostname>-<workspace-path>").
+  ---"--<local-hostname>--<workspace-path>--").
   profile = nil,
 
   ---Save the remote nvim session to <profile>/session.vim when the server

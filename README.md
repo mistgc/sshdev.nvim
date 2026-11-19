@@ -15,7 +15,7 @@ local UI / --remote-ui client  ⇄  ssh -N -L  ⇄  remote nvim --headless --lis
   workspace) pair:
 
   ```
-  <remote_root>/<local-hostname>-<workspace-path>/
+  <remote_root>/--<local-hostname>--<workspace-path>--/
   ```
 
   The key uses the **local** hostname, so several laptops sharing one
@@ -113,7 +113,7 @@ the picker forgets an entry.
 ~/.sshdev.nvim/
 ├── _bin/                                  nvim releases, shared by profiles
 │   └── <version>-<asset>/
-└── <local-hostname>-<workspace-path>/     one profile per client + workspace
+└── --<local-hostname>--<workspace-path>--/     one profile per client + workspace
     ├── nvim-config/                       uploaded config (NVIM_APPNAME)
     ├── data/                              XDG_DATA_HOME (plugins, shada)
     ├── state/  cache/                     XDG state/cache

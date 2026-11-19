@@ -18,7 +18,7 @@ Terminology ~
 	profile		the remote state directory for one
 			(client machine, workspace) pair:
 							*sshdev-profile*
-			  <remote_root>/<local-hostname>-<workspace-path>/
+			  <remote_root>/--<local-hostname>--<workspace-path>--/
 			The key uses the LOCAL hostname, so several client
 			machines sharing one remote account stay isolated
 			(config, plugins, data, session, logs).
@@ -133,7 +133,7 @@ detaches first, the attach fails, and the process ends -- which makes
 REMOTE LAYOUT						*sshdev-remote-layout*
 
     ~/.sshdev.nvim/_bin/<version>-<asset>/    nvim releases (shared)
-    ~/.sshdev.nvim/<local-host>-<ws-path>/    one profile
+    ~/.sshdev.nvim/--<local-host>-<ws-path>--/    one profile
         nvim-config/                          uploaded config
         data/ state/ cache/                   XDG data/state/cache
         session.lua                           session helper
@@ -186,7 +186,7 @@ workspace ~
 
 profile ~
 	Force the profile directory name. Default:
-	"<local-hostname>-<workspace-path>". Both clients and workspaces
+	"--<local-hostname>--<workspace-path>--". Both clients and workspaces
 	stay isolated; the picker remembers them for you.
 
 nvim_version ~

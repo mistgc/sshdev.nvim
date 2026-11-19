@@ -2,7 +2,7 @@
 ---
 --- Terminology:
 ---   workspace  the remote PROJECT DIRECTORY the server runs in
----   profile    <remote_root>/<local-hostname>-<workspace-path>/ holding the
+---   profile    <remote_root>/--<local-hostname>--<workspace-path>--/ holding the
 ---              uploaded config, plugins, data, session.vim and logs
 ---
 --- Pipeline:
