@@ -61,13 +61,23 @@ function M.check()
   if cfg.nvim_version ~= 'auto' then
     vim.health.info(('nvim_version pinned to %q'):format(cfg.nvim_version))
   end
-  vim.health.info(('local hostname namespace: %s'):format(require('sshdev.util').os_hostname()))
-  vim.health.ok(('session persistence: %s'):format(cfg.session and 'on (session.vim)' or 'off'))
+  vim.health.info(('local hostname namespace: %s'):format(Util.os_hostname()))
+  local auto_key = require('sshdev.session').auto_nvim_profile_key(cfg)
+  if auto_key then
+    vim.health.info(('auto nvim profile (reused by new workspaces): %s'):format(auto_key))
+  else
+    vim.health.warn('cannot derive the auto nvim profile key for the current config')
+  end
+  if cfg.nvim_profile and cfg.nvim_profile ~= 'auto' then
+    vim.health.info(('nvim_profile pinned to %s'):format(cfg.nvim_profile))
+  end
+  vim.health.ok(('session persistence: %s'):format(cfg.session and 'on (per-workspace session.vim)' or 'off'))
   vim.health.info(('attach strategy: %s'):format(cfg.attach))
+  vim.health.info(('bootstrap lock timeout: %ss'):format(cfg.timeouts.lock))
 
   local hist = require('sshdev.history').list()
   if #hist > 0 then
-    vim.health.ok(('%d remembered connection(s)'):format(#hist))
+    vim.health.ok(('%d remembered workspace(s)'):format(#hist))
   end
 
   -- 4. remote reachability (bounded, synchronous)

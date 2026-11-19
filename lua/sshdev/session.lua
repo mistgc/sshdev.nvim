@@ -1,18 +1,25 @@
 --- Session orchestration for sshdev.nvim.
 ---
+--- Two-level profile model:
+---
+---   nvim profile       reusable (config content + nvim version + client host):
+---                      <root>/nvim-profiles/--<host>-<version>-<hash8>--/
+---   workspace profile  per (client host, workspace): session + server state:
+---                      <root>/workspace-profiles/--<host>--<ws-path>--/
+---
 --- Connect pipeline (async, driven by Proc.launch):
 ---
----   probe remote ─► resolve profile (local host + workspace path)
+---   probe remote ─► resolve version + local config content hash ─► layout
 ---        │
----        ├─ ensure nvim binary + read server status + sync fingerprint
----        │        (one ssh round trip)
+---        ├─ ensure: nvim bin (shared by version) + profile/server state
+---        │        (one ssh round trip, read-only for profiles)
 ---        │
----        ├─ server already running ─────────────────────► attach
+---        ├─ server already running ─────────────────────────────► attach
 ---        │
----        └─ sync fingerprint differs / no binary ─► scp config
----                 ─► headless plugin install ─► mark synced
----                 ─► start detached server (restores session.vim)
----                 ─► ssh -N -L tunnel ─► attach
+---        └─ prepare profiles ─► upload session helper
+---                 ├─ nvim profile .ready == config hash ─► start server
+---                 └─ otherwise: scp config to staging ─► headless install
+---                      ─► mark .ready ─► start server ─► tunnel ─► attach
 ---
 --- There is no quit hijacking: the remote server simply quits on :q and
 --- saves session.vim on the way out, so the next connection restores it.
@@ -20,6 +27,7 @@
 local Bootstrap = require('sshdev.bootstrap')
 local Config = require('sshdev.config')
 local History = require('sshdev.history')
+local Layout = require('sshdev.layout')
 local Proc = require('sshdev.proc')
 local Ssh = require('sshdev.ssh')
 local Util = require('sshdev.util')
@@ -27,7 +35,7 @@ local Util = require('sshdev.util')
 local M = {}
 
 local state = {
-  info = nil, -- { dest, port, profile, key, workspace, lport, rport }
+  info = nil, -- { dest, port, workspace, workspace_profile, nvim_profile, lport, rport }
   tunnel = nil, -- ssh tunnel handle (only when WE started it)
   attached = false, -- a :connect was issued from this session
 }
@@ -88,9 +96,9 @@ local function resolve_dest(cfg, arg)
   return parsed, nil
 end
 
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 -- Attach
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 
 ---Classify the UI we run in: the builtin TUI is the UI on channel 1,
 ---external GUIs attach over an RPC channel (> 1).
@@ -123,7 +131,10 @@ local function report_after_ui_exit(cfg, code)
     parsed.port = info.port
   end
   Proc.launch(function()
-    local st = Bootstrap.server_status(cfg, parsed, { profile = info.profile })
+    local st = Bootstrap.server_status(cfg, parsed, {
+      workspace_profile = info.workspace_profile,
+      nvim_profile = info.nvim_profile,
+    })
     if st and st.running then
       Util.notify('detached — the remote server keeps running (:SSHdevAttach)')
       return
@@ -239,13 +250,13 @@ end
 
 ---Open the tunnel (or reuse an existing one) and attach.
 ---Must run inside a flow coroutine.
-local function run_attach(cfg, parsed, ctx, rport)
+local function run_attach(cfg, parsed, layout, rport)
   if state.tunnel then
     state.tunnel.kill()
     state.tunnel = nil
   end
 
-  local lbase = Util.local_port(parsed.dest, ctx.profile)
+  local lbase = Util.local_port(parsed.dest, layout.workspace_profile_key)
   local lport
   if Proc.await_tcp_probe('127.0.0.1', lbase, 400, 2000) then
     lport = lbase
@@ -264,9 +275,11 @@ local function run_attach(cfg, parsed, ctx, rport)
   state.info = {
     dest = Util.format_dest(parsed),
     port = parsed.port,
-    profile = ctx.profile,
-    key = ctx.key,
-    workspace = ctx.workspace,
+    workspace = layout.workspace,
+    workspace_profile = layout.workspace_profile,
+    workspace_profile_key = layout.workspace_profile_key,
+    nvim_profile = layout.nvim_profile,
+    nvim_profile_key = layout.nvim_profile_key,
     lport = lport,
     rport = rport,
   }
@@ -301,7 +314,7 @@ local function run_attach(cfg, parsed, ctx, rport)
       .. 'after %ds.\n%s/server.log on the remote and :SSHdevLog may help.\n%s'):format(
       lport,
       cfg.timeouts.attach,
-      ctx.profile,
+      layout.workspace_profile,
       tail
     ))
   end
@@ -311,21 +324,22 @@ local function run_attach(cfg, parsed, ctx, rport)
   attach_ui(cfg, ('127.0.0.1:%d'):format(lport))
   History.record(cfg, {
     dest = Util.format_dest(parsed),
-    workspace = ctx.workspace,
-    profile_key = ctx.key,
+    workspace = layout.workspace,
+    workspace_profile_key = layout.workspace_profile_key,
+    nvim_profile_key = layout.nvim_profile_key,
   })
 end
 
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 -- Shared front half
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 
----Guards + destination resolution + probe + profile context.
+---Guards + destination resolution + remote probe.
 ---@param opts table
 ---@return table? cfg
 ---@return table? parsed
----@return table? ctx
-local function prepare(opts)
+---@return table? probe
+local function prepare_probe(opts)
   local cfg = Config.get()
   if opts.cfg then
     cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
@@ -342,16 +356,31 @@ local function prepare(opts)
     Util.report_error(derr)
     return nil
   end
-  -- a path embedded in the destination ("host:~/proj") is also accepted
-  local workspace = opts.workspace or parsed.path or cfg.workspace
-  if opts.workspace and parsed.path then
-    Util.report_error('destination already contains a workspace path; drop the second argument')
-    return nil
-  end
 
   local probe, perr = Bootstrap.probe(cfg, parsed)
   if not probe then
     Util.report_error(perr)
+    return nil
+  end
+  return cfg, parsed, probe
+end
+
+---Build the full remote layout for a connect-ish flow.
+---@param opts table
+---@return table? cfg
+---@return table? parsed
+---@return table? layout
+---@return table? probe
+local function prepare(opts)
+  local cfg, parsed, probe = prepare_probe(opts)
+  if not cfg then
+    return nil
+  end
+
+  -- a path embedded in the destination ("host:~/proj") is also accepted
+  local workspace = opts.workspace or parsed.path or cfg.workspace
+  if opts.workspace and parsed.path then
+    Util.report_error('destination already contains a workspace path; drop the second argument')
     return nil
   end
 
@@ -364,42 +393,166 @@ local function prepare(opts)
     Util.log('installing the nightly build remotely (local nvim is a dev build)')
   end
 
-  local ctx, cerr = Bootstrap.profile_ctx(cfg, parsed, probe, workspace)
-  if not ctx then
-    Util.report_error(cerr)
+  local layout, lerr = Layout.build({
+    home = probe.home,
+    remote_root = cfg.remote_root,
+    hostname = Util.os_hostname(),
+    nvim_version = version,
+    config_hash = Util.config_content_hash(cfg),
+    workspace = workspace,
+    workspace_profile_name = cfg.workspace_profile,
+    nvim_profile_key = opts.nvim_profile or cfg.nvim_profile,
+  })
+  if not layout then
+    Util.report_error(lerr)
     return nil
   end
-  ctx.version = version
-  Util.log('profile "%s" -> %s (workspace %s)', ctx.key, ctx.profile, ctx.workspace)
-  return cfg, parsed, ctx
+
+  Util.log('nvim profile "%s" -> %s', layout.nvim_profile_key, layout.nvim_profile)
+  Util.log(
+    'workspace profile "%s" -> %s (workspace %s)',
+    layout.workspace_profile_key,
+    layout.workspace_profile,
+    layout.workspace
+  )
+  return cfg, parsed, layout, probe
 end
 
-------------------------------------------------------------------------
+---Should this connection (re)install the config + plugins?
+---
+---The nvim profile key already is the config content hash, so `.ready`
+---matching the hash means "this exact config + version is installed" and the
+---expensive step can be skipped -- that is what makes a NEW workspace reuse
+---the plugins of an existing profile.
+---@param info table|nil Bootstrap.ensure() result
+---@param layout table
+---@param opts table|nil { force = boolean }
+---@return boolean
+function M.needs_bootstrap(info, layout, opts)
+  opts = opts or {}
+  if opts.force then
+    return true
+  end
+  if not info then
+    return true
+  end
+  return (info.np_ready or '') ~= layout.config_hash
+end
+
+---A user-supplied nvim profile key may not exist on the remote. Fall back to
+---the content-derived profile with a warning instead of silently installing
+---into a directory whose name does not describe its content.
+---@param layout table
+---@return table? auto_layout
+local function fallback_layout(layout)
+  return Layout.build({
+    home = layout.home,
+    remote_root = layout.root,
+    hostname = layout.hostname,
+    nvim_version = layout.nvim_version,
+    config_hash = layout.config_hash,
+    workspace = layout.workspace,
+    workspace_profile_name = layout.workspace_profile_name,
+    nvim_profile_key = 'auto',
+  })
+end
+
+---Pure decision behind |apply_reuse()| (exported for tests):
+---  'own'      bootstrap/refresh this client's own profile (auto key)
+---  'reuse'    use an explicitly requested existing profile as-is
+---  'fallback' the explicit profile is missing/incomplete -> use the auto key
+---@param layout table
+---@param info table Bootstrap.ensure() result
+---@return 'own'|'reuse'|'fallback'
+function M.reuse_action(layout, info)
+  if not layout.explicit_nvim_profile then
+    return 'own'
+  end
+  if layout.nvim_profile_key == Layout.auto_nvim_profile_key(layout) then
+    return 'own'
+  end
+  if info and info.np_exists and (info.np_ready or '') ~= '' then
+    return 'reuse'
+  end
+  return 'fallback'
+end
+
+---Decide whether an explicitly requested nvim profile can really be reused.
+---
+---Auto-derived keys are owned by this client: they are bootstrapped from the
+---current config content, so the normal readiness rule applies.
+---
+---An explicit --nvim-profile key is a REUSED, immutable profile: its config is
+---whatever was installed when it was created. The current local config must
+---NOT be uploaded into it (that would break the "key == content hash"
+---invariant). If the requested profile is missing or never finished
+---installing, fall back to the auto profile with a warning.
+---@param parsed table
+---@param layout table
+---@param info table Bootstrap.ensure() result (AUTO_* fields are used on fallback)
+---@return table layout effective layout
+---@return table info effective info
+---@return boolean reuse_only true = use the profile as-is, no install
+local function apply_reuse(parsed, layout, info)
+  local action = M.reuse_action(layout, info)
+  if action == 'own' then
+    return layout, info, false
+  end
+  if action == 'reuse' then
+    Util.log('reusing nvim profile %s as-is (explicit --nvim-profile)', layout.nvim_profile_key)
+    return layout, info, true
+  end
+  local auto = fallback_layout(layout)
+  if not auto then
+    return layout, info, false
+  end
+  Util.notify(
+    ('nvim profile %s %s on %s; using the auto profile %s instead'):format(
+      layout.nvim_profile_key,
+      info.np_exists and 'is incomplete (it never finished installing)' or 'does not exist',
+      parsed.dest,
+      auto.nvim_profile_key
+    ),
+    vim.log.levels.WARN
+  )
+  Util.log('explicit nvim profile unusable; fell back to %s', auto.nvim_profile_key)
+  info.np_exists = info.auto_exists
+  info.np_ready = info.auto_ready
+  return auto, info, false
+end
+
+-----------------------------------------------------------------------
 -- Public flows
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 
 ---`:SSHdevConnect[!] [dest] [workspace]` — full pipeline or fast re-attach.
----@param opts table { dest?, workspace?, force?, reuse_only? }
+---@param opts table { dest?, workspace?, force?, reuse_only?, nvim_profile?, cfg? }
 function M.connect(opts)
   opts = opts or {}
   Proc.launch(function()
-    local cfg, parsed, ctx = prepare(opts)
+    local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
 
-    Util.status(('preparing nvim %s on the remote ...'):format(ctx.version))
-    local info, ierr = Bootstrap.ensure(cfg, parsed, ctx)
+    Util.status(('preparing nvim %s on the remote ...'):format(layout.nvim_version))
+    local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
     if not info then
       fail(ierr)
     end
     Util.log('remote nvim: %s (%s)', info.bin, info.version_line)
 
-    -- Fast path: a server is already running for this profile.
+    -- Explicit reuse: an existing profile is used AS-IS (no config upload, no
+    -- plugin install). Missing/incomplete explicit profiles fall back to the
+    -- auto profile with a warning.
+    local reuse_only_profile
+    layout, info, reuse_only_profile = apply_reuse(parsed, layout, info)
+
+    -- Fast path: a server is already running for this workspace profile.
     if info.server == 'running' then
       if opts.force then
         Util.status('restarting the remote server ...')
-        local kok, kerr = Bootstrap.stop_server(cfg, parsed, ctx)
+        local kok, kerr = Bootstrap.stop_server(cfg, parsed, layout)
         if not kok then
           Util.notify(kerr, vim.log.levels.WARN)
         end
@@ -411,45 +564,67 @@ function M.connect(opts)
         if not rport then
           fail('the remote server is running but its listen address is unknown; run :SSHdevConnect! to restart it')
         end
-        return run_attach(cfg, parsed, ctx, rport)
+        return run_attach(cfg, parsed, layout, rport)
       end
     elseif opts.reuse_only then
       fail('no remote server is running for this workspace; use :SSHdevConnect')
     end
 
-    -- Cold path: sync config only when it actually changed.
-    local fingerprint = Util.config_fingerprint(cfg)
-    local needs_sync = opts.force or cfg.force_sync or info.synced ~= fingerprint
+    local bootstrap_needed = (not reuse_only_profile) and M.needs_bootstrap(info, layout, opts)
+    if reuse_only_profile and opts.force then
+      Util.notify(
+        'explicit nvim profile reuse: config sync/install skipped (only the server is restarted)',
+        vim.log.levels.WARN
+      )
+    end
 
-    if needs_sync then
+    -- Create/refresh both profiles and their relative links, then the helper.
+    local prep, perr = Bootstrap.prepare(cfg, parsed, layout, {
+      own = not reuse_only_profile,
+      staging = bootstrap_needed,
+    })
+    if not prep then
+      fail(perr)
+    end
+    local helper, herr = Bootstrap.upload_helper(cfg, parsed, layout)
+    if not helper then
+      fail(herr)
+    end
+
+    -- Cold path: install into the nvim profile only when the content is not
+    -- already there. A new workspace with the same config skips this.
+    if bootstrap_needed then
       Util.status('uploading config (scp) ...')
-      local up, uerr = Bootstrap.upload_config(cfg, parsed, ctx)
+      local up, uerr = Bootstrap.upload_config(cfg, parsed, layout)
       if not up then
         fail(uerr)
       end
-      local helper, herr = Bootstrap.upload_session_helper(cfg, parsed, ctx)
-      if not helper then
-        fail(herr)
+      Util.status('installing plugins in the nvim profile ...')
+      local commit, cerr = Bootstrap.commit_profile(cfg, parsed, layout, { force = opts.force })
+      if not commit then
+        fail(cerr)
       end
-      Util.status('installing plugins on the remote ...')
-      local inst, insterr = Bootstrap.install_plugins(cfg, parsed, ctx)
-      if not inst then
-        fail(insterr)
-      end
-      Bootstrap.mark_synced(cfg, parsed, ctx, fingerprint)
+      Util.log(
+        'nvim profile %s %s',
+        layout.nvim_profile_key,
+        commit.installed and 'installed' or 'already ready'
+      )
+    elseif reuse_only_profile then
+      -- apply_reuse() already logged the as-is reuse; nothing else to do
     else
-      Util.log('config unchanged since last sync (fingerprint %s)', fingerprint)
-      -- still make sure the session helper is present (cheap, tiny file)
-      Bootstrap.upload_session_helper(cfg, parsed, ctx)
+      Util.log(
+        'reusing nvim profile %s (config content unchanged, plugins already installed)',
+        layout.nvim_profile_key
+      )
     end
 
     -- Start the server.
-    local rbase = Util.remote_port(parsed.dest, ctx.profile)
+    local rbase = Util.remote_port(parsed.dest, layout.workspace_profile_key)
     local server, serr
     for attempt = 0, 2 do
       local rport = rbase + attempt
       Util.status(('starting remote server on 127.0.0.1:%d ...'):format(rport))
-      server, serr = Bootstrap.start_server(cfg, parsed, ctx, rport, opts.restore_session)
+      server, serr = Bootstrap.start_server(cfg, parsed, layout, rport, opts.restore_session)
       if server then
         break
       end
@@ -460,7 +635,7 @@ function M.connect(opts)
     end
 
     local rport = tonumber((server.addr or ''):match(':(%d+)$')) or rbase
-    run_attach(cfg, parsed, ctx, rport)
+    run_attach(cfg, parsed, layout, rport)
   end)
 end
 
@@ -468,55 +643,106 @@ end
 function M.install(opts)
   opts = opts or {}
   Proc.launch(function()
-    local cfg, parsed, ctx = prepare(opts)
+    local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
-    Util.status(('preparing nvim %s on the remote ...'):format(ctx.version))
-    local info, ierr = Bootstrap.ensure(cfg, parsed, ctx)
+    Util.status(('preparing nvim %s on the remote ...'):format(layout.nvim_version))
+    local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
     if not info then
       fail(ierr)
     end
-    Util.log('remote nvim: %s (%s)', info.bin, info.version_line)
+    local reuse_only_profile
+    layout, info, reuse_only_profile = apply_reuse(parsed, layout, info)
+    local bootstrap_needed = (not reuse_only_profile) and M.needs_bootstrap(info, layout, opts)
 
-    Util.status('uploading config (scp) ...')
-    local up, uerr = Bootstrap.upload_config(cfg, parsed, ctx)
-    if not up then
-      fail(uerr)
+    local prep, perr = Bootstrap.prepare(cfg, parsed, layout, {
+      own = not reuse_only_profile,
+      staging = bootstrap_needed,
+    })
+    if not prep then
+      fail(perr)
     end
-    local helper, herr = Bootstrap.upload_session_helper(cfg, parsed, ctx)
+    local helper, herr = Bootstrap.upload_helper(cfg, parsed, layout)
     if not helper then
       fail(herr)
     end
-    Util.status('installing plugins on the remote ...')
-    local inst, insterr = Bootstrap.install_plugins(cfg, parsed, ctx)
-    if not inst then
-      fail(insterr)
+
+    if bootstrap_needed then
+      Util.status('uploading config (scp) ...')
+      local up, uerr = Bootstrap.upload_config(cfg, parsed, layout)
+      if not up then
+        fail(uerr)
+      end
+      Util.status('installing plugins in the nvim profile ...')
+      local commit, cerr = Bootstrap.commit_profile(cfg, parsed, layout, { force = opts.force })
+      if not commit then
+        fail(cerr)
+      end
+    else
+      Util.log('nvim profile %s is already installed (reuse only)', layout.nvim_profile_key)
     end
-    Bootstrap.mark_synced(cfg, parsed, ctx, Util.config_fingerprint(cfg))
-    Util.notify(('profile "%s" is ready — :SSHdevConnect to attach'):format(ctx.key))
+
+    Util.notify(
+      ('nvim profile "%s" is ready — :SSHdevConnect to start a server'):format(layout.nvim_profile_key)
+    )
   end)
 end
 
----`:SSHdevSync [dest] [workspace]` — re-upload config + helper only.
+---`:SSHdevSync [dest] [workspace]` — re-upload config + helper (and reinstall).
 function M.sync(opts)
   opts = opts or {}
   Proc.launch(function()
-    local cfg, parsed, ctx = prepare(opts)
+    local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
-    Util.status('uploading config (scp) ...')
-    local up, uerr = Bootstrap.upload_config(cfg, parsed, ctx)
-    if not up then
-      fail(uerr)
+    local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
+    if not info then
+      fail(ierr)
     end
-    local helper, herr = Bootstrap.upload_session_helper(cfg, parsed, ctx)
+    -- Sync always targets THIS config's own profile: an explicitly reused
+    -- profile belongs to some other config content and must not be overwritten.
+    if layout.explicit_nvim_profile and layout.nvim_profile_key ~= Layout.auto_nvim_profile_key(layout) then
+      local auto_layout = fallback_layout(layout)
+      if auto_layout then
+        Util.notify(
+          ('cannot sync the explicitly reused nvim profile %s; syncing the auto profile %s instead'):format(
+            layout.nvim_profile_key,
+            auto_layout.nvim_profile_key
+          ),
+          vim.log.levels.WARN
+        )
+        layout = auto_layout
+        info.np_exists = info.auto_exists
+        info.np_ready = info.auto_ready
+      end
+    end
+
+    local prep, perr = Bootstrap.prepare(cfg, parsed, layout, { own = true, staging = true })
+    if not prep then
+      fail(perr)
+    end
+    local helper, herr = Bootstrap.upload_helper(cfg, parsed, layout)
     if not helper then
       fail(herr)
     end
-    Bootstrap.mark_synced(cfg, parsed, ctx, Util.config_fingerprint(cfg))
-    Util.notify(('synced to %s — use :SSHdevConnect! to restart the server'):format(ctx.profile))
+    Util.status('uploading config (scp) ...')
+    local up, uerr = Bootstrap.upload_config(cfg, parsed, layout)
+    if not up then
+      fail(uerr)
+    end
+    Util.status('installing plugins in the nvim profile ...')
+    local commit, cerr = Bootstrap.commit_profile(cfg, parsed, layout, { force = true })
+    if not commit then
+      fail(cerr)
+    end
+    Util.notify(
+      ('synced nvim profile "%s" (%s) — use :SSHdevConnect! to restart the server'):format(
+        layout.nvim_profile_key,
+        layout.nvim_profile
+      )
+    )
   end)
 end
 
@@ -536,7 +762,7 @@ function M.stop()
     if parsed then
       parsed.port = info.port
     end
-    local ok, err = Bootstrap.stop_server(cfg, parsed, { profile = info.profile })
+    local ok, err = Bootstrap.stop_server(cfg, parsed, { workspace_profile = info.workspace_profile })
     if not ok then
       fail(err)
     end
@@ -545,20 +771,41 @@ function M.stop()
   end)
 end
 
----`:SSHdevStatus` — session, tunnel, remote server, remembered connections.
+---Auto nvim profile key for the current local config (for :SSHdevStatus/health).
+---@param cfg table
+---@return string? key
+---@return string? err
+function M.auto_nvim_profile_key(cfg)
+  local Keys = require('sshdev.keys')
+  local version, _, _ = Bootstrap.resolve_version(cfg)
+  local hash = Util.config_content_hash(cfg)
+  local hash8 = Keys.config_hash8(hash)
+  if not hash8 then
+    return nil, 'cannot hash the local config'
+  end
+  return Keys.nvim_profile_key(Util.os_hostname(), version, hash8)
+end
+
+---`:SSHdevStatus` — session, tunnel, profiles, remote server, history.
 function M.status()
   Proc.launch(function()
     local cfg = Config.get()
     local lines = {}
     local tag, dev = Util.nvim_version_tag()
     lines[#lines + 1] = ('local nvim: %s%s'):format(tag, dev and ' (dev build)' or '')
+    lines[#lines + 1] = ('client host: %s'):format(Util.os_hostname())
+    local auto_key = M.auto_nvim_profile_key(cfg)
+    if auto_key then
+      lines[#lines + 1] = ('auto nvim profile: %s'):format(auto_key)
+    end
 
     if state.info then
       local info = state.info
       local up = (state.tunnel and state.tunnel.alive) or state.attached
       lines[#lines + 1] = ('session: %s'):format(info.dest)
       lines[#lines + 1] = ('workspace: %s'):format(info.workspace)
-      lines[#lines + 1] = ('profile: %s'):format(info.profile)
+      lines[#lines + 1] = ('workspace profile: %s'):format(info.workspace_profile)
+      lines[#lines + 1] = ('nvim profile: %s'):format(info.nvim_profile)
       lines[#lines + 1] = ('tunnel: %s (127.0.0.1:%d -> 127.0.0.1:%d)'):format(
         up and 'up' or 'down',
         info.lport or -1,
@@ -568,7 +815,10 @@ function M.status()
       if parsed then
         parsed.port = info.port
       end
-      local st = Bootstrap.server_status(cfg, parsed, { profile = info.profile })
+      local st = Bootstrap.server_status(cfg, parsed, {
+        workspace_profile = info.workspace_profile,
+        nvim_profile = info.nvim_profile,
+      })
       if st and st.running then
         lines[#lines + 1] = ('remote server: running (pid %s, %s)'):format(st.pid or '?', st.addr or '?')
         lines[#lines + 1] = ('saved session: %s'):format(st.has_session and 'yes' or 'no')
@@ -581,9 +831,57 @@ function M.status()
 
     local entries = History.list()
     if #entries > 0 then
-      lines[#lines + 1] = ('remembered connections: %d (:SSHdevConnect to pick one)'):format(#entries)
+      lines[#lines + 1] = ('remembered workspaces: %d (:SSHdevHistory to pick one)'):format(#entries)
     end
 
+    for _, l in ipairs(lines) do
+      Util.log('%s', l)
+    end
+    Util.notify(table.concat(lines, '\n'))
+  end)
+end
+
+---List the nvim profiles that exist on the remote for this client host.
+---@param opts table|nil { dest = string }
+function M.profiles(opts)
+  opts = opts or {}
+  Proc.launch(function()
+    local cfg, parsed, probe = prepare_probe(opts)
+    if not cfg then
+      return
+    end
+    local root = Util.remote_root_abs(cfg, probe.home)
+    local list, err = Bootstrap.list_nvim_profiles(cfg, parsed, root)
+    if not list then
+      fail(err)
+    end
+    History.cache_nvim_profiles(
+      parsed.dest,
+      vim.tbl_map(function(p)
+        return p.key
+      end, list)
+    )
+
+    local lines = {
+      ('nvim profiles on %s (client host %s):'):format(Util.format_dest(parsed), Util.os_hostname()),
+    }
+    if #list == 0 then
+      lines[#lines + 1] = '  (none yet — :SSHdevConnect installs one)'
+    end
+    for _, p in ipairs(list) do
+      local used = ''
+      if (p.workspace_count or 0) > 0 then
+        used = ('  (%d workspace(s))'):format(p.workspace_count)
+      end
+      lines[#lines + 1] = ('  %s  %s  %s%s'):format(
+        p.key,
+        tostring(p.version or '?'),
+        p.ready_hash and 'ready' or 'incomplete',
+        used
+      )
+    end
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = 'reuse one with: :SSHdevConnect <dest> <workspace> --nvim-profile=<key>'
     for _, l in ipairs(lines) do
       Util.log('%s', l)
     end
@@ -604,8 +902,31 @@ function M.pick(opts)
     M.connect({
       dest = entry.dest,
       workspace = entry.workspace,
+      nvim_profile = entry.nvim_profile_key,
       force = opts.force,
     })
+  end)
+end
+
+---Open the workspace history picker (`:SSHdevHistory`): scans the remote
+---workspace profiles of this client host (user isolation) and reuses their
+---nvim profile key.
+---@param opts table|nil { dest = string }
+function M.pick_history(opts)
+  opts = opts or {}
+  local cfg = Config.get()
+  local Picker = require('sshdev.picker')
+  Proc.launch(function()
+    Picker.select_history(cfg, function(entry)
+      if not entry then
+        return
+      end
+      M.connect({
+        dest = entry.dest,
+        workspace = entry.workspace,
+        nvim_profile = entry.nvim_profile_key,
+      })
+    end, { dest = opts.dest })
   end)
 end
 

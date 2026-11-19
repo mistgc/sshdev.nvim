@@ -7,37 +7,57 @@ persistent remote server and session restore.
 local UI / --remote-ui client  ⇄  ssh -N -L  ⇄  remote nvim --headless --listen
 ```
 
+The state on the remote host is split into two independent levels:
+
+- a **nvim profile** — *your config + the plugin instances* (plus a link to one
+  nvim release). It is reusable: every workspace with the same config content
+  and nvim version shares it, so plugins are installed **once**, not once per
+  workspace.
+- a **workspace profile** — the per-`(client machine, project dir)` session and
+  server state. It links to a nvim profile.
+
 ## Terminology
 
 - **workspace** — the remote **project directory** the server runs in
   (e.g. `~/src/app`).
-- **profile** — the remote state directory for one (client machine,
-  workspace) pair:
+- **nvim profile** — an immutable, reusable bundle of the uploaded config and
+  the plugin data, keyed by
 
   ```
-  <remote_root>/--<local-hostname>--<workspace-path>--/
+  <remote_root>/nvim-profiles/--<local-hostname>-<nvim-version>-<hash8-config-content>--/
   ```
 
-  The key uses the **local** hostname, so several laptops sharing one
-  remote account never overwrite each other's config, plugins, data or
-  session.
+  The key contains the local hostname (isolation between laptops sharing one
+  remote account), the nvim version and the first 8 hex characters of the
+  **content hash** of the uploaded config. Two workspaces using the same config
+  therefore share one installed profile.
+- **workspace profile** — the session/server state for one
+  (client machine, workspace) pair:
+
+  ```
+  <remote_root>/workspace-profiles/--<local-hostname>--<workspace-path>--/
+  ```
+
+  It holds `session.vim`, the server pid/address/log and a relative symlink to
+  the nvim profile (`nvim-profile -> ../../nvim-profiles/<nvim-profile-key>`).
 
 ## What it does
 
-1. **Uploads your `stdpath("config")`** to `<profile>/nvim-config/` with
-   `scp` (respects an `excludes` glob list; skipped when the local config
-   fingerprint matches the remote `.synced` marker).
-2. **Installs a Neovim release matching your local version** under
-   `~/.sshdev.nvim/_bin/<version>-<asset>/`
-   (Linux x86_64/aarch64, macOS arm64/x86_64; downloads via an optional
-   **proxy** or mirror).
-3. **Installs your plugins** by running the remote nvim headless once
-   (your plugin manager's bootstrap does the cloning).
-4. **Starts a detached remote server** in the workspace, forwards it with
-   `ssh -N -L`, and **attaches** a UI.
+1. **Installs a Neovim release matching your local version** under
+   `<remote_root>/nvim-bins/<nvim-version>/` (Linux x86_64/aarch64, macOS
+   arm64/x86_64; downloads via an optional **proxy** or mirror). The profile
+   links to it with `nvim-bin -> ../../nvim-bins/<nvim-version>`.
+2. **Uploads your `stdpath("config")`** into the nvim profile and runs a
+   headless install **once per config content hash**, so your plugin manager
+   clones the plugins once.
+3. **Reuses that nvim profile for any other workspace** — the second, third, …
+   workspace with the same config skips both the upload and the plugin install
+   and starts in seconds.
+4. **Starts a detached remote server** in the workspace (session saved per
+   workspace), forwards it with `ssh -N -L`, and **attaches** a UI.
 5. **Saves and restores the Neovim session**: the server writes
-   `<profile>/session.vim` when it exits, so the next connection brings
-   back the same buffers, windows and layout. `:q` behaves normally —
+   `<workspace-profile>/session.vim` when it exits, so the next connection
+   brings back the same buffers, windows and layout. `:q` behaves normally —
    there is no quit hijacking.
 
 MIT licensed.
@@ -50,7 +70,7 @@ MIT licensed.
   forwarding.
 - Key-based authentication is strongly recommended.
 
-## Install
+## Installing
 
 With `lazy.nvim`:
 
@@ -58,7 +78,8 @@ With `lazy.nvim`:
 {
   'mistgc/sshdev.nvim',
   cmd = { 'SSHdevConnect', 'SSHdevAttach', 'SSHdevInstall', 'SSHdevSync',
-          'SSHdevStop', 'SSHdevStatus', 'SSHdevHistory', 'SSHdevLog' },
+          'SSHdevStop', 'SSHdevStatus', 'SSHdevHistory', 'SSHdevProfiles',
+          'SSHdevLog' },
   config = function()
     require('sshdev').setup({
       host = 'me@myhost',              -- default destination
@@ -70,7 +91,7 @@ With `lazy.nvim`:
 }
 ```
 
-With telescope (optional — enables the fuzzy connection picker):
+With telescope (optional — enables the fuzzy pickers):
 
 ```lua
 { 'mistgc/sshdev.nvim', dependencies = { 'nvim-telescope/telescope.nvim' } }
@@ -80,23 +101,75 @@ With telescope (optional — enables the fuzzy connection picker):
 ## Usage
 
 ```
-:SSHdevConnect                    " picker: remembered connections (+ new)
-:SSHdevConnect me@myhost          " any [user@]host[:port]
+:SSHdevConnect                       " picker: remembered connections (+ new)
+:SSHdevConnect me@myhost             " any [user@]host[:port]
 :SSHdevConnect me@myhost:2222 ~/src/app
-:SSHdevConnect work               " a destination named in setup({ remotes = ... })
-:SSHdevConnect!                   " resync config + plugins, restart server
-:SSHdevAttach                     " attach to a RUNNING server, no bootstrap
-:SSHdevInstall                    " bootstrap only, no server / no attach
-:SSHdevSync                       " re-upload config + helper only
-:SSHdevStop                       " stop the server (saves session) + tunnel
-:SSHdevStatus                     " session / tunnel / server / history report
-:SSHdevHistory                    " remembered-connection picker
-:SSHdevLog                        " open the log
-:checkhealth sshdev               " verify local + remote environment
+:SSHdevConnect work                  " a destination named in setup({ remotes = ... })
+:SSHdevConnect me@myhost ~/src/app --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+                                     " new workspace reusing an existing nvim profile
+:SSHdevConnect!                      " restart server, re-sync into the profile
+:SSHdevAttach                        " attach to a RUNNING server, no bootstrap
+:SSHdevInstall                       " bootstrap the nvim profile only, no server
+:SSHdevSync                          " re-upload config + reinstall plugins
+:SSHdevStop                          " stop the server (saves session) + tunnel
+:SSHdevStatus                        " session / profiles / tunnel / server report
+:SSHdevHistory [dest]                " remote workspace picker (client-host scoped)
+:SSHdevProfiles [dest]               " list reusable nvim profiles on the remote
+:SSHdevLog                           " open the log
+:checkhealth sshdev                  " verify local + remote environment
 ```
 
 On the remote session `:q` behaves normally: the server quits and saves
 `session.vim`. Reconnect with `:SSHdevConnect` and the session is restored.
+
+### Reusing an nvim profile
+
+The default `nvim_profile = 'auto'` derives the key from
+`(local hostname, nvim version, config content hash)`. Because the key *is* the
+config identity:
+
+- editing your config produces a new key and a fresh one-time install;
+- **`touch`ing files does not** (the hash is content-based);
+- connecting a **new workspace** with an unchanged config reuses the existing
+  profile — no scp, no plugin install.
+
+To reuse a profile that was installed from a different config state (for
+example "pin this project to the plugins it was set up with"), pass the key
+explicitly:
+
+```vim
+" discover the keys available for this client host
+:SSHdevProfiles me@myhost
+
+" create a new workspace that reuses an existing profile
+:SSHdevConnect me@myhost ~/src/second --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+```
+
+```lua
+require('sshdev').connect({
+  dest = 'me@myhost',
+  workspace = '~/src/second',
+  nvim_profile = '--laptop-v0.12.6-1a2b3c4d--',
+})
+```
+
+An explicitly reused profile is used **as-is**: its config and plugins are
+never overwritten (that would break the "key = content hash" invariant). If the
+requested key does not exist or never finished installing, sshdev falls back to
+the auto profile with a warning.
+
+`:SSHdevConnect` with no arguments offers the same choice interactively: pick
+"new connection", type `dest` and `workspace`, then choose `auto` or one of the
+existing nvim profiles.
+
+### Workspace history (`:SSHdevHistory`)
+
+The history picker asks the remote host for **all workspace profiles whose
+`client-host` equals this machine's local hostname**, merges them with the
+local connection history (recency/counts) and lets you reconnect. Because the
+remote scan is host-filtered, several laptops sharing one remote account never
+see or adopt each other's workspaces/session state. `<C-d>` forgets a local
+entry.
 
 ### Telescope
 
@@ -104,36 +177,59 @@ On the remote session `:q` behaves normally: the server quits and saves
 :Telescope sshdev connections
 ```
 
-or `:lua require('telescope').extensions.sshdev.connections()`. `<C-d>` in
-the picker forgets an entry.
+or `:lua require('telescope').extensions.sshdev.connections()`.
 
 ## How it works
 
 ```
 ~/.sshdev.nvim/
-├── _bin/                                  nvim releases, shared by profiles
-│   └── <version>-<asset>/
-└── --<local-hostname>--<workspace-path>--/     one profile per client + workspace
-    ├── nvim-config/                       uploaded config (NVIM_APPNAME)
-    ├── data/                              XDG_DATA_HOME (plugins, shada)
-    ├── state/  cache/                     XDG state/cache
-    ├── session.lua                        server-side session helper
-    ├── session.vim                        saved Neovim session
-    ├── .synced                            fingerprint of the synced config
-    ├── server.pid  server.addr
-    └── server.log
+├── nvim-bins/
+│   └── <nvim-version>/                          nvim releases (shared)
+│       ├── bin/nvim
+│       └── .platform                            OS/arch marker
+├── nvim-profiles/
+│   └── --<local-hostname>-<nvim-version>-<hash8-config-content>--/
+│       ├── nvim-bin -> ../../nvim-bins/<nvim-version>/   (relative symlink)
+│       ├── nvim-config/                        uploaded config (NVIM_APPNAME)
+│       ├── xdg/share/                          XDG_DATA_HOME (plugins)
+│       ├── xdg/state/  xdg/cache/              XDG state/cache
+│       ├── nvim-version  config-hash  client-host
+│       └── .ready                              bootstrap-complete marker
+└── workspace-profiles/
+    └── --<local-hostname>--<workspace-path>--/
+        ├── nvim-profile -> ../../nvim-profiles/<nvim-profile-key>/
+        ├── nvim-profile.txt  workspace.txt  client-host
+        ├── session.lua                         server-side session helper
+        ├── session.vim  last_used
+        └── server.pid  server.addr  server.log
 ```
 
-- Each profile has its own XDG dirs, so plugin installs and state stay
-  isolated between workspaces and between client machines.
+- The server runs with `XDG_CONFIG_HOME=<nvim-profile>`,
+  `XDG_DATA_HOME=<nvim-profile>/xdg/share`,
+  `XDG_STATE_HOME=<nvim-profile>/xdg/state`,
+  `XDG_CACHE_HOME=<nvim-profile>/xdg/cache` and
+  `NVIM_APPNAME=nvim-config`, so the config is exactly
+  `<nvim-profile>/nvim-config` and the plugins land in
+  `<nvim-profile>/xdg/share/nvim-config/`.
+- **Reuse rule**: a config upload + headless plugin install runs only when
+  `<nvim-profile>/.ready` does not equal the local config content hash (or
+  `:SSHdevConnect!`/`:SSHdevSync` forces it). A second workspace with the same
+  config skips the expensive path entirely.
+- **Atomic bootstrap**: the config is scp'd into
+  `<nvim-profile>/.staging-<token>/nvim-config`, then a single remote script
+  takes a `mkdir` lock, swaps it into place, runs the headless install and
+  writes `.ready` last. Concurrent connects to two new workspaces serialize on
+  that lock (waiting up to `timeouts.lock`), so plugins are never installed
+  twice in parallel.
+- Each **workspace profile** has its own session and server runtime files; the
+  nvim profile has its own plugin/state dirs. State never collides with the
+  remote user's own nvim.
 - The server listens on `127.0.0.1:<port>` (reachable only through the
-  tunnel). The local port is deterministic per (destination, profile).
-- The config upload and plugin install are **skipped** when the local config
-  fingerprint matches the remote `.synced` marker, so reconnecting after a
-  quit is fast.
-- Server liveness is found through `server.pid`, with a fallback to
-  matching the unique `<profile>/session.lua` command line — a lost pid
-  file never starts a second server on the same port.
+  tunnel). The local port is deterministic per (destination, workspace
+  profile).
+- Server liveness is found through `server.pid`, with a fallback to matching
+  the unique `<workspace-profile>/session.lua` command line — a lost pid file
+  never starts a second server on the same port.
 
 ### Session persistence (no quit hijacking)
 
@@ -142,6 +238,9 @@ the picker forgets an entry.
 | `:q`, `:wq`, `:qa`, `SIGTERM` (`:SSHdevStop`) | server exits → `session.vim` written (VimLeavePre) |
 | `FocusLost` / `VimSuspend` | best-effort snapshot |
 | next `:SSHdevConnect` | server restarts and `session.vim` is restored (VimEnter) |
+
+Sessions live in the workspace profile: two workspaces can share one nvim
+profile (config + plugins) while keeping independent buffers/layouts.
 
 Disable with `session = false`; start clean while still saving with
 `restore_session = false`.
@@ -180,6 +279,20 @@ back after quitting the remote one).
 
 Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
 
+## Upgrading from the old single-profile layout
+
+Before this refactor every `(client, workspace)` had one directory containing
+config, plugins, session and server files. The new layout reuses
+`<remote_root>/_bin/<version>-<asset>/` by moving it to
+`<remote_root>/nvim-bins/<version>/` when the asset matches (no re-download),
+and copies an old `session.vim` into the new workspace profile on the first
+connect. Old plugin trees are not migrated: the first connect installs the
+nvim profile once.
+
+Stop old servers before upgrading (`:SSHdevStop`, or `kill` the remote nvim);
+they are not adopted by the new layout. Old profile directories can be removed
+with `rm -rf <remote_root>/--*` once you no longer need them.
+
 ## Configuration
 
 All options (see `:h sshdev-setup`):
@@ -190,9 +303,10 @@ require('sshdev').setup({
   remotes = { work = 'me@work.example.com:2222' },
 
   workspace = '~/src/app',   -- default remote project directory
-  profile = nil,             -- force the profile dir name
+  workspace_profile = nil,   -- force the workspace profile dir name
+  nvim_profile = 'auto',     -- 'auto' | '--<host>-<version>-<hash8>--' (reuse)
 
-  session = true,            -- save <profile>/session.vim on exit
+  session = true,            -- save <workspace-profile>/session.vim on exit
   restore_session = true,    -- restore it when the server starts
 
   ssh_bin = 'ssh', scp_bin = 'scp',
@@ -209,7 +323,7 @@ require('sshdev').setup({
   history = true,            -- remember connections for the picker
   history_limit = 50,
 
-  timeouts = { ssh = 60, download = 600, install = 900, attach = 30 },
+  timeouts = { ssh = 60, download = 600, install = 900, attach = 30, lock = 120 },
 })
 ```
 
@@ -221,10 +335,20 @@ Notes:
   GitHub-restricted networks. Set `download_mirror` for a mirror.
 - `install_commands` run after your uploaded `init` is sourced during the
   headless install run.
+- `excludes` are globbed against config-relative paths and are part of the
+  content hash: changing them creates a new nvim profile (a one-time install).
+- `nvim_profile` is normally `'auto'`; pin a key to reuse a specific existing
+  profile for a new workspace.
 - History entries keep the **full destination including the ssh port**, so
   picking one reconnects to the right port.
 
 ## FAQ
+
+**Why did my second workspace connect so fast?**
+Because the nvim profile key is the config content hash: the profile from the
+first workspace is reused, so there is no scp and no plugin install. Check
+`:SSHdevLog` — the install phase only appears when the config (or nvim version)
+changed.
 
 **Where did the `:q` hijacking go?**
 It was replaced by session persistence: `:q` quits normally, and the server
@@ -241,10 +365,15 @@ When you want to keep your local nvim alive while working remotely: it opens a
 separate `nvim --server … --remote-ui` client in a terminal tab, so quitting
 the remote session returns you to the local one.
 
-**Why upload the whole config instead of plugin specs?**
+**Why is the whole config uploaded instead of plugin specs?**
 You want the remote session to behave exactly like home. The upload skips
-`excludes` entries and is skipped entirely when the fingerprint is
-unchanged.
+`excludes` entries, lands in a content-addressed profile and is reused by every
+workspace with the same config.
+
+**How do I get rid of old nvim profiles?**
+Each config edit creates a new `nvim-profiles/--…--` directory (the old one is
+kept for reuse/pinning). `:SSHdevProfiles` lists them; delete unused ones with
+`rm -rf <remote_root>/nvim-profiles/<key>` when no workspace links to them.
 
 ## License
 

@@ -1,13 +1,14 @@
 -- sshdev.nvim remote server helper: session persistence.
 --
 -- Copied to the remote host as
---   ~/.sshdev.nvim/<local-host>-<workspace-path>/session.lua
+--   ~/.sshdev.nvim/workspace-profiles/--<host>--<ws-path>--/session.lua
 -- and loaded by the remote server with
---   nvim --headless --listen 127.0.0.1:<port> -c 'luafile <profile>/session.lua'
+--   nvim --headless --listen 127.0.0.1:<port> -c 'luafile <ws profile>/session.lua'
 --
 -- Environment set by the start script:
 --   SSHDEV_REMOTE=1
---   SSHDEV_PROFILE=<absolute profile dir>
+--   SSHDEV_WORKSPACE_PROFILE=<absolute workspace profile dir>
+--   SSHDEV_NVIM_PROFILE=<absolute nvim profile dir>
 --   SSHDEV_SESSION=<absolute session.vim path, or empty>
 --   SSHDEV_RESTORE=1|0
 --
@@ -25,7 +26,9 @@ end
 
 local session_path = vim.env.SSHDEV_SESSION or ''
 local restore = vim.env.SSHDEV_RESTORE ~= '0'
-local profile = vim.env.SSHDEV_PROFILE or ''
+-- SSHDEV_PROFILE is the pre-refactor name; keep reading it for one upgrade.
+local workspace_profile = vim.env.SSHDEV_WORKSPACE_PROFILE or vim.env.SSHDEV_PROFILE or ''
+local nvim_profile = vim.env.SSHDEV_NVIM_PROFILE or ''
 
 local function esc(p)
   return vim.fn.fnameescape(p)
@@ -84,8 +87,10 @@ vim.api.nvim_create_autocmd({ 'FocusLost', 'VimSuspend' }, {
   desc = 'sshdev: snapshot the session',
 })
 
-if profile ~= '' then
-  pcall(vim.api.nvim_echo, {
-    { ('sshdev: remote profile %s'):format(profile), 'None' },
-  }, false, {})
+if workspace_profile ~= '' then
+  local label = ('sshdev: workspace profile %s'):format(workspace_profile)
+  if nvim_profile ~= '' then
+    label = label .. (' (nvim profile %s)'):format(nvim_profile)
+  end
+  pcall(vim.api.nvim_echo, { { label, 'None' } }, false, {})
 end

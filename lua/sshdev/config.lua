@@ -1,13 +1,23 @@
 --- Configuration for sshdev.nvim (`require("sshdev").setup(opts)`).
 ---
 --- Terminology:
----   * workspace       -- the remote PROJECT DIRECTORY (e.g. ~/src/app)
----   * profile         -- remote state dir for (local host, workspace):
----                        <remote_root>/--<local-hostname>--<workspace-path>--/
----                        It holds the uploaded config, plugins, data,
----                        session.vim and logs, isolating different client
----                        machines that share one remote account.
+---   * workspace          -- the remote PROJECT DIRECTORY (e.g. ~/src/app)
+---   * nvim profile       -- an immutable, reusable bundle of (uploaded
+---                           config + plugin instances + a link to the nvim
+---                           binary of one version):
+---                             <remote_root>/nvim-profiles/<nvim-profile-key>/
+---                           The key is derived from the LOCAL hostname, the
+---                           nvim version and the config CONTENT hash, so
+---                           several client machines sharing one remote
+---                           account never share a profile by accident, and
+---                           a second workspace with the same config reuses
+---                           the plugins that are already installed.
+---   * workspace profile  -- the per-(local host, workspace) runtime state:
+---                           session, server pid/addr/log and a link to the
+---                           nvim profile:
+---                             <remote_root>/workspace-profiles/<workspace-key>/
 
+local Keys = require('sshdev.keys')
 local Util = require('sshdev.util')
 
 ---List type check: vim.islist (0.11+) with the older tbl_islist fallback.
@@ -27,12 +37,20 @@ M.defaults = {
   ---in). Absolute or "~/...". Defaults to the remote $HOME.
   workspace = nil,
 
-  ---Force the profile directory name (default:
-  ---"--<local-hostname>--<workspace-path>--").
-  profile = nil,
+  ---Force the workspace profile directory name (default:
+  ---"--<local-hostname>--<workspace-path>--"). Deprecated alias: `profile`.
+  workspace_profile = nil,
 
-  ---Save the remote nvim session to <profile>/session.vim when the server
-  ---exits, and restore it on the next start.
+  ---Which nvim profile to use:
+  ---  "auto"              derive the key from (local hostname, nvim version,
+  ---                      config content hash) -- the default, and what makes
+  ---                      a new workspace reuse an already installed profile
+  ---  "--<host>-<version>-<hash8>--"  reuse that exact existing profile
+  nvim_profile = 'auto',
+
+  ---Save the remote nvim session to
+  ---<workspace profile>/session.vim when the server exits, and restore it on
+  ---the next start.
   session = true,
 
   ---Restore session.vim when (re)starting the server. Set false to start
@@ -47,7 +65,10 @@ M.defaults = {
   ---e.g. { "-i", "~/.ssh/id_ed25519", "-o", "Compression=yes" }.
   ssh_args = {},
 
-  ---Remote root for all sshdev state: "<root>/<profile>/" and "<root>/_bin/".
+  ---Remote root for all sshdev state:
+  ---  <root>/nvim-bins/<version>/             nvim releases (shared)
+  ---  <root>/nvim-profiles/<key>/             reusable config + plugins
+  ---  <root>/workspace-profiles/<key>/        session + server state
   remote_root = '~/.sshdev.nvim',
 
   ---Which nvim release to install on the remote:
@@ -94,6 +115,7 @@ M.defaults = {
     download = 600, -- remote nvim download
     install = 900, -- remote headless plugin install
     attach = 30, -- waiting for the tunnel + server to accept RPC
+    lock = 120, -- waiting for another client bootstrapping the same profile
   },
 }
 
@@ -137,10 +159,19 @@ function M.build(opts)
     end
     opts.remote_dir = nil
   end
+  -- deprecated alias: profile -> workspace_profile
+  if opts.profile ~= nil then
+    if opts.workspace_profile == nil then
+      opts.workspace_profile = opts.profile
+    end
+    opts.profile = nil
+  end
   -- removed option: quit hijacking (session save/restore replaced it).
   -- Drop it silently so old configs keep working instead of carrying a
   -- meaningless key around.
   opts.hijack_quit = nil
+  -- dropped option: the content hash decides when to resync now.
+  opts.force_sync = nil
   local cfg = merge(vim.deepcopy(M.defaults), opts)
   local err = M.validate(cfg)
   return cfg, err
@@ -194,12 +225,23 @@ function M.validate(cfg)
     if w:sub(1, 1) ~= '~' and w:sub(1, 1) ~= '/' then
       return 'setup: "workspace" must be absolute or "~"-relative'
     end
-    if w:find("['\r\n]") then
-      return 'setup: "workspace" must not contain quotes or newlines'
+    if w:find("['\r\n\t]") then
+      return 'setup: "workspace" must not contain quotes, tabs or newlines'
     end
   end
-  if cfg.profile ~= nil and (type(cfg.profile) ~= 'string' or cfg.profile == '') then
-    return 'setup: "profile" must be a non-empty directory name'
+  if cfg.workspace_profile ~= nil then
+    if type(cfg.workspace_profile) ~= 'string' or cfg.workspace_profile == '' then
+      return 'setup: "workspace_profile" must be a non-empty directory name'
+    end
+    if cfg.workspace_profile:find("[/\\'\"\r\n\t]") then
+      return 'setup: "workspace_profile" must be a single path segment'
+    end
+  end
+  if cfg.nvim_profile ~= nil and cfg.nvim_profile ~= 'auto' then
+    local ok, err = Keys.validate_nvim_profile_key(cfg.nvim_profile)
+    if not ok then
+      return 'setup: "nvim_profile": ' .. tostring(err)
+    end
   end
   if type(cfg.session) ~= 'boolean' then
     return 'setup: "session" must be a boolean'
@@ -222,14 +264,17 @@ function M.validate(cfg)
   if type(cfg.remote_root) ~= 'string' or cfg.remote_root == '' then
     return 'setup: "remote_root" must be a non-empty path'
   end
-  if cfg.remote_root:find("['\r\n]") then
-    return 'setup: "remote_root" must not contain quotes or newlines'
+  if cfg.remote_root:find("['\r\n\t]") then
+    return 'setup: "remote_root" must not contain quotes, tabs or newlines'
   end
   if cfg.remote_root:sub(1, 1) ~= '~' and cfg.remote_root:sub(1, 1) ~= '/' then
     return 'setup: "remote_root" must be absolute or "~"-relative'
   end
   if type(cfg.nvim_version) ~= 'string' or cfg.nvim_version == '' then
     return 'setup: "nvim_version" must be "auto", a "vX.Y.Z" tag, "nightly" or "stable"'
+  end
+  if cfg.nvim_version ~= 'auto' and not Keys.is_valid_version(cfg.nvim_version) then
+    return 'setup: "nvim_version" must be a safe release tag (letters, digits, ".", "_", "-")'
   end
   if cfg.proxy ~= nil then
     if type(cfg.proxy) ~= 'string' or cfg.proxy == '' then
@@ -259,7 +304,7 @@ function M.validate(cfg)
   if type(cfg.timeouts) ~= 'table' then
     return 'setup: "timeouts" must be a table of seconds'
   end
-  for _, k in ipairs({ 'ssh', 'download', 'install', 'attach' }) do
+  for _, k in ipairs({ 'ssh', 'download', 'install', 'attach', 'lock' }) do
     local v = cfg.timeouts[k]
     if type(v) ~= 'number' or v <= 0 then
       return ('setup: timeouts.%s must be a positive number of seconds'):format(k)

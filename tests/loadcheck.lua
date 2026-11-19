@@ -13,9 +13,12 @@ package.path = table.concat({
 
 local modules = {
   'sshdev.util',
+  'sshdev.keys',
+  'sshdev.layout',
   'sshdev.config',
   'sshdev.proc',
   'sshdev.ssh',
+  'sshdev.remote_scripts',
   'sshdev.bootstrap',
   'sshdev.history',
   'sshdev.picker',

@@ -1,21 +1,24 @@
 --- sshdev.nvim — develop on remote hosts with your local Neovim config.
 ---
 --- Terminology:
----   workspace  the remote PROJECT DIRECTORY the server runs in
----   profile    <remote_root>/--<local-hostname>--<workspace-path>--/ holding the
----              uploaded config, plugins, data, session.vim and logs
+---   nvim profile       reusable bundle of uploaded config + plugin instances
+---                      + a link to one nvim version's binary:
+---                        <remote_root>/nvim-profiles/--<host>-<version>-<hash8>--/
+---   workspace profile  per (local host, workspace) session/server state:
+---                        <remote_root>/workspace-profiles/--<host>--<ws-path>--/
 ---
 --- Pipeline:
----   1. your config is scp'd to <profile>/nvim-config/
----   2. a nvim binary matching your local version is installed under
----      ~/.sshdev.nvim/_bin/ (download through a proxy/mirror if configured)
----      and a headless run installs the plugins declared in your config
----   3. the remote server starts in the workspace, forwarding through an
----      ssh tunnel; the local UI attaches (--remote-ui for the TUI)
+---   1. a nvim binary matching your local version is installed under
+---      <remote_root>/nvim-bins/<version>/ (proxy/mirror supported)
+---   2. your config is uploaded into a REUSABLE nvim profile and a headless
+---      run installs the plugins once; every other workspace with the same
+---      config content reuses that profile and skips the install
+---   3. the remote server starts in the workspace (session kept per workspace),
+---      forwarding through an ssh tunnel; the local UI attaches
 ---   4. the server saves session.vim when it exits; the next connection
 ---      restores it. There is no quit hijacking.
 ---
---- Requires Neovim >= 0.11 on both ends.
+--- Requires Neovim >= 0.12 on both ends.
 
 local M = {}
 
@@ -47,7 +50,9 @@ local function session()
 end
 
 ---Connect to a remote workspace (like |:SSHdevConnect|).
----opts: { dest = "[user@]host[:port]", workspace = "remote project dir", force = bool }
+---opts: { dest = "[user@]host[:port]", workspace = "remote project dir",
+---        nvim_profile = "--<host>-<version>-<hash8>--" (reuse an existing
+---        nvim profile), force = bool }
 function M.connect(opts)
   session().connect(opts)
 end
@@ -61,6 +66,18 @@ end
 ---Open the connection picker (telescope / vim.ui.select).
 function M.pick(opts)
   session().pick(opts)
+end
+
+---Open the workspace picker for one destination (remote scan filtered to this
+---client hostname). `opts.dest` selects the destination; otherwise `host` or
+---the single configured remote is used.
+function M.pick_history(opts)
+  session().pick_history(opts)
+end
+
+---List the nvim profiles that exist on the remote for this client host.
+function M.profiles(opts)
+  session().profiles(opts)
 end
 
 ---Bootstrap the remote (binary + config + plugins) without attaching.

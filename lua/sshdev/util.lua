@@ -88,14 +88,15 @@ function M.shquote(s)
   return "'" .. tostring(s):gsub("'", [['\'']]) .. "'"
 end
 
----Assert a value can be embedded inside single quotes in a shell script
----(no single quotes / newlines). Throws a user-visible error otherwise.
+---Assert a value can be embedded inside single quotes in a shell script or
+---inside the TAB-separated listing protocol (no quotes / tabs / newlines).
+---Throws a user-visible error otherwise.
 ---@param s any
 ---@param what string
 ---@return string
 function M.shsafe(s, what)
   s = tostring(s or '')
-  if s:find("['\r\n]") then
+  if s:find("['\t\r\n]") then
     error(("sshdev: %s contains characters that cannot be safely used remotely: %s"):format(what or 'value', s), 0)
   end
   return s
@@ -218,7 +219,8 @@ end
 -- Workspace names / ports
 ------------------------------------------------------------------------
 
----Small stable string hash (djb2), used for short suffixes and port choices.
+---Small stable string hash (djb2), used for short suffixes, port choices and
+---as a sha256 fallback.
 ---@param s string
 ---@return integer
 local function djb2(s)
@@ -227,6 +229,31 @@ local function djb2(s)
     h = (h * 33 + s:byte(i)) % 2147483648
   end
   return h
+end
+
+---Hex digest of a string: sha256 when available, djb2 fallback otherwise.
+---@param s string
+---@return string
+function M.sha_hex(s)
+  s = tostring(s or '')
+  if vim.fn and vim.fn.sha256 then
+    local ok, out = pcall(vim.fn.sha256, s)
+    if ok and type(out) == 'string' and out ~= '' then
+      return out:lower()
+    end
+  end
+  return ('%08x%08x'):format(djb2(s), #s % 2147483648)
+end
+
+---Normalize a hash string and return its first 8 hex characters (or nil).
+---@param hash string|nil
+---@return string? hash8
+function M.hash8(hash)
+  local h = tostring(hash or ''):lower():gsub('[^%x]', '')
+  if #h < 8 then
+    return nil
+  end
+  return h:sub(1, 8)
 end
 
 ---Sanitize a string into a single safe path segment:
@@ -266,7 +293,7 @@ function M.os_hostname()
   return M.sanitize_segment(name, 32)
 end
 
----Profile directory name for a remote workspace.
+---Workspace profile directory name for a remote workspace.
 ---
 ---Format: "--<local-hostname>--<workspace-path>--"
 ---   e.g. "--DESKTOP-ABC--home-me-src-app--"
@@ -278,7 +305,7 @@ end
 ---@param local_hostname string
 ---@param workspace_abs string absolute remote path
 ---@return string
-function M.profile_key(local_hostname, workspace_abs)
+function M.workspace_profile_key(local_hostname, workspace_abs)
   local host = M.sanitize_segment(local_hostname or 'localhost', 32)
   local ws = tostring(workspace_abs or '')
   -- "/home/me/src/app" -> "home-me-src-app"
@@ -287,13 +314,8 @@ function M.profile_key(local_hostname, workspace_abs)
   return '--' .. host .. '--' .. ws_key .. '--'
 end
 
-local function djb2(s)
-  local h = 5381
-  for i = 1, #s do
-    h = (h * 33 + s:byte(i)) % 2147483648
-  end
-  return h
-end
+---Backwards-compatible alias for |workspace_profile_key()|.
+M.profile_key = M.workspace_profile_key
 
 ---Deterministic local tunnel port in [20000, 39999].
 function M.local_port(dest, ws)
@@ -555,6 +577,11 @@ function M.rmrf(path)
     end
     M.rmrf(M.fs_join(path, name))
   end
+  -- fs_unlink(DeleteFile) fails on Windows directories: use fs_rmdir when
+  -- available and only fall back to unlink on very old libuv builds.
+  if uv.fs_rmdir then
+    return uv.fs_rmdir(path) == true
+  end
   return uv.fs_unlink(path) == true
 end
 
@@ -647,15 +674,34 @@ function M.plugin_root()
   return root
 end
 
----Stage the local nvim config into stdpath("cache")/sshdev/stage/nvim-config
----(wiping the previous stage). Returns the parent dir; scp is then run with
----a RELATIVE source from there (avoids the Windows "C:" ambiguity).
+---Generate a short path-safe token (unique staging dirs, etc.).
+---@return string
+function M.staging_token()
+  if uv and uv.hrtime then
+    return ('%x'):format(uv.hrtime())
+  end
+  return ('%x'):format(os.time()) .. ('%x'):format(math.random(0, 0xffffff))
+end
+
+---Stage the local nvim config into a UNIQUE
+---stdpath("cache")/sshdev/stage-<token>/nvim-config directory.
+---
+---Every call gets its own directory so two nvim instances connecting at the
+---same time cannot wipe each other's staged tree. Returns the parent dir; scp
+---is then run with a RELATIVE source from there (avoids the Windows "C:"
+---ambiguity). The caller removes the parent once the upload finished.
 ---@param cfg table
+---@param token string|nil staging token (tests); generated when nil
+---@param src string|nil config root (defaults to stdpath("config"))
 ---@return string? parent
 ---@return string? dirname_or_err
-function M.stage_config(cfg)
-  local src = vim.fs.normalize(vim.fn.stdpath('config'))
-  local parent = M.fs_join(vim.fs.normalize(vim.fn.stdpath('cache')), 'sshdev', 'stage')
+function M.stage_config(cfg, token, src)
+  src = vim.fs.normalize(src or vim.fn.stdpath('config'))
+  local parent = M.fs_join(
+    vim.fs.normalize(vim.fn.stdpath('cache')),
+    'sshdev',
+    'stage-' .. tostring(token or M.staging_token())
+  )
   local dst = M.fs_join(parent, 'nvim-config')
   M.rmrf(parent)
   local globs = cfg.excludes or {}
@@ -669,20 +715,27 @@ function M.stage_config(cfg)
   return parent, 'nvim-config'
 end
 
----Fingerprint of the LOCAL nvim config (respecting upload excludes).
+---Content hash of the LOCAL nvim config (respecting upload excludes).
 ---
----Used to skip the scp upload + headless plugin install when nothing
----changed since the last successful sync for a workspace profile.
----Cheap and order-independent: path + size + mtime of every file.
+---This is the IDENTITY of an nvim profile: the remote key embeds its first 8
+---hex characters, so two clients with the same config+version share one
+---profile. Hashing CONTENT (not mtime) is what makes reuse useful: `touch`
+---never forces a plugin reinstall, while an actual edit produces a new key.
+---Order-independent: paths are sorted; per-file digests are combined.
 ---@param cfg table
----@return string
-function M.config_fingerprint(cfg)
-  local src = vim.fs.normalize(vim.fn.stdpath('config'))
-  local globs = cfg.excludes or {}
-  local parts = {}
+---@param dir string|nil config root (defaults to stdpath("config"))
+---@return string hash 16 lowercase hex characters
+function M.config_content_hash(cfg, dir)
+  local src = vim.fs.normalize(dir or vim.fn.stdpath('config'))
+  local globs = (cfg and cfg.excludes) or {}
+  local files = {}
 
-  local function walk(dir, rel)
-    local handle = uv.fs_scandir(dir)
+  local function walk(path, rel, depth)
+    if depth > 64 then
+      -- symlink cycle guard: a config tree deeper than this is not sane
+      return
+    end
+    local handle = uv.fs_scandir(path)
     if not handle then
       return
     end
@@ -693,27 +746,40 @@ function M.config_fingerprint(cfg)
       end
       local child_rel = (rel ~= '' and (rel .. '/') or '') .. name
       if not M.excluded(child_rel, globs) then
-        local path = M.fs_join(dir, name)
+        local child = M.fs_join(path, name)
         local real = typ
         if typ == 'link' then
-          local st = uv.fs_stat(path)
+          local st = uv.fs_stat(child)
           real = st and st.type or nil
         end
         if real == 'directory' then
-          walk(path, child_rel)
+          walk(child, child_rel, depth + 1)
         elseif real == 'file' then
-          local st = uv.fs_stat(path)
-          parts[#parts + 1] = ('%s:%d:%d'):format(child_rel, st and st.size or 0, st and st.mtime.sec or 0)
+          files[#files + 1] = child_rel
         end
       end
     end
   end
 
   if uv.fs_stat(src) then
-    walk(src, '')
+    walk(src, '', 0)
   end
-  table.sort(parts)
-  return ('%08x%08x'):format(djb2(table.concat(parts, '\n')), #parts)
+  table.sort(files)
+
+  local parts = { 'sshdev-config-v1' }
+  for _, rel in ipairs(files) do
+    local content = ''
+    local fd = uv.fs_open(M.fs_join(src, rel), 'r', 438)
+    if fd then
+      local st = uv.fs_fstat(fd)
+      if st then
+        content = uv.fs_read(fd, st.size, 0) or ''
+      end
+      uv.fs_close(fd)
+    end
+    parts[#parts + 1] = rel .. '\0' .. M.sha_hex(content)
+  end
+  return M.sha_hex(table.concat(parts, '\n')):sub(1, 16)
 end
 
 ---Absolute remote root path (~-expanded) for a configuration.
