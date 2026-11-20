@@ -90,6 +90,14 @@ function M.sync(opts)
   session().sync(opts)
 end
 
+---Open the workspace's port-forward editor (like |:SshDevForward|):
+---the forward.txt of the workspace profile, fetched into a local buffer.
+---Saving that buffer re-uploads it and (re)starts the forwards.
+---opts: { dest = "[user@]host[:port]", workspace = "remote project dir" }
+function M.forward(opts)
+  session().forward(opts)
+end
+
 ---Stop the remote server (saves session.vim) and the local tunnel.
 function M.stop()
   session().stop()

@@ -27,7 +27,8 @@ The remote state is split into two levels:
 			the per-(client machine, workspace) runtime state:
 			  <remote_root>/workspace-profiles/
 			    --<local-hostname>--<workspace-path>--/
-			It holds session.vim, server pid/address/log and a
+			It holds session.vim, the port-forward list forward.txt
+			(see |sshdev-forwards|), server pid/address/log and a
 			relative symlink `nvim-profile` to the nvim profile.
 			The key uses the LOCAL hostname so several client
 			machines sharing one remote account stay isolated.
@@ -115,6 +116,25 @@ COMMANDS						*sshdev-commands*
 	the remote for this client host: key, nvim version, ready state and
 	the number of workspace profiles referencing them.
 
+*:SshDevForward*
+:SshDevForward [{dest}] [{workspace}]
+	Edit the port forwards of a workspace: opens its
+	`<workspace-profile>/forward.txt` (fetched into a local buffer; an
+	all-commented template is created when the file does not exist
+	yet). One forward per line: >
+	    3080 = 127.0.0.1:3080
+	    8080 = 127.0.0.1:8080
+<	forwards THIS client's 127.0.0.1:3080/8080 to the SERVER's
+	127.0.0.1:3080/8080. SAVING the buffer re-uploads the file to the
+	workspace profile and replaces the running forwards: one detached
+	`ssh -N` carries a `-L` per line (loopback-bound; the target may
+	be any host the SERVER can reach, e.g. `5432 = db.internal:5432`).
+	`#`-lines and blank lines are ignored; an empty file stops all
+	forwards. Invalid lines are reported with their line numbers and
+	change nothing. Without arguments the ACTIVE session's workspace
+	profile is used; [dest] [workspace] resolve it like
+	:SshDevConnect. See |sshdev-forwards|.
+
 *:SshDevLog*
 :SshDevLog			Open the sshdev log buffer.
 
@@ -200,6 +220,60 @@ detaches first, the attach fails, and the process ends -- which makes
 	"command"   do not attach; just report the command to run
 
 ==============================================================================
+PORT FORWARDS						*sshdev-forwards*
+
+`:SshDevForward` manages custom ssh port forwards for a workspace. The
+forward list is per-(client, workspace) state, so it lives in the REMOTE
+workspace profile, next to session.vim: >
+
+	<remote_root>/workspace-profiles/--<host>--<ws-path>--/forward.txt
+
+Format -- one forward per line: >
+
+	<local-port> = <remote-host>:<remote-port>
+	3080 = 127.0.0.1:3080
+	8080 = 127.0.0.1:8080
+
+The local side binds 127.0.0.1 on THIS machine; the target address is
+resolved on the SERVER, so "127.0.0.1" is the server itself and
+"db.internal:5432" reaches hosts only the server can see. `#`-lines and
+blank lines are ignored. IPv6 target literals are not supported (the
+same limitation as destinations, |sshdev-commands|).
+
+Editing happens on a local mirror under
+|stdpath()|'s "cache"/sshdev/forward/<workspace-profile-key>/forward.txt:
+the command fetches the remote file (creating an all-commented template
+when it does not exist yet) and opens it in a split. SAVING the buffer
+(:w) runs the apply pipeline:
+
+	parse ─► scp back to the workspace profile ─► kill the previous
+	forward tunnel ─► start ONE detached `ssh -N` carrying a `-L`
+	per line, then WAIT until the tunnel verifiably accepts
+	connections (ExitOnForwardFailure: a bind ssh cannot do -- a
+	busy port, a Windows reserved range, a rejected auth -- kills
+	the process).
+
+	* invalid lines are reported with line numbers; NOTHING is applied
+	  (the remote copy and the running forwards stay unchanged)
+	* when the new tunnel dies on start, the PREVIOUS set is restored
+	  and ssh's own error is reported -- a bad save never leaves the
+	  workspace without its working forwards
+	* an empty / comment-only file stops all forwards
+	* re-saving restarts the whole set atomically (one ssh process)
+	* the buffer stays open: edit again and :w re-applies
+
+The forward tunnel is stopped by :SshDevStop and when the local nvim
+exits (like the session tunnel; it survives a |:connect| that keeps the
+local instance alive as a UI client). forward.txt persists remotely, so
+re-establishing after a restart is one :SshDevForward + :w away.
+
+Forwards do not depend on the nvim server: they work whether or not one
+is running, and with password authentication they use the same masked
+askpass mechanism as the tunnel (|sshdev-auth|).
+
+Local listeners bind loopback only -- nothing is exposed to the network.
+
+==============================================================================
 PASSWORD AUTHENTICATION					*sshdev-auth*
 
 `auth = "auto"` (the default) tries key/ssh-agent first, fully
@@ -276,7 +350,7 @@ REMOTE LAYOUT						*sshdev-layout*
         ├── nvim-profile -> ../../nvim-profiles/<key>/  (relative symlink)
         ├── nvim-profile.txt  workspace.txt  client-host
         ├── session.lua                           session helper
-        ├── session.vim  last_used
+        ├── session.vim  forward.txt  last_used
         └── server.pid  server.addr  server.log
 
 The server runs with `NVIM_APPNAME=nvim-config` and the XDG dirs pointing into
@@ -428,6 +502,19 @@ the remote server log is `<workspace-profile>/server.log`.
   cannot save) and that `restore_session` is true.
 - Port collisions -- local/remote ports are deterministic per workspace
   profile; start retries with incremented remote ports automatically.
+- Forwards stopped -- the forward tunnel dies with the local nvim
+  (:SshDevStop / VimLeavePre, like the session tunnel). Re-open
+  :SshDevForward and save (:w); forward.txt persists in the workspace
+  profile.
+- "cannot forward: local port(s) ... in use" -- another process holds the
+  port (a leftover ssh from a crashed nvim can; check "ss -ltn" /
+  "netstat -an"). Free it or pick a different local port in forward.txt;
+  the previously running forwards keep running. On Windows the pre-check
+  can miss an occupied port (libuv binds with SO_REUSEADDR), but the
+  verified start still catches it: the new tunnel dies, ssh's bind error
+  is reported and the previous forwards are restored.
+- forward.txt parse errors -- the save reported the exact lines; nothing
+  was uploaded or applied until they are fixed.
 - Old layout after upgrading -- see |sshdev-layout| (binaries and saved
   sessions are migrated; plugins are reinstalled once).
 

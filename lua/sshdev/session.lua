@@ -27,6 +27,7 @@
 local Auth = require('sshdev.auth')
 local Bootstrap = require('sshdev.bootstrap')
 local Config = require('sshdev.config')
+local Forward = require('sshdev.forward')
 local History = require('sshdev.history')
 local Layout = require('sshdev.layout')
 local Proc = require('sshdev.proc')
@@ -36,7 +37,7 @@ local Util = require('sshdev.util')
 local M = {}
 
 local state = {
-  info = nil, -- { dest, port, workspace, workspace_profile, nvim_profile, lport, rport }
+  info = nil, -- { dest, port, workspace, workspace_profile, workspace_profile_key, nvim_profile, nvim_profile_key, remote_root, lport, rport }
   tunnel = nil, -- ssh tunnel handle (only when WE started it)
   attached = false, -- a :connect was issued from this session
 }
@@ -281,6 +282,7 @@ local function run_attach(cfg, parsed, layout, rport)
     workspace_profile_key = layout.workspace_profile_key,
     nvim_profile = layout.nvim_profile,
     nvim_profile_key = layout.nvim_profile_key,
+    remote_root = layout.root,
     lport = lport,
     rport = rport,
   }
@@ -758,6 +760,73 @@ function M.sync(opts)
   end)
 end
 
+---`:SshDevForward [dest] [workspace]` — edit this workspace's port
+---forwards: the `forward.txt` of the workspace profile, fetched into a
+---local buffer; saving that buffer re-uploads it and (re)starts the
+---`ssh -N -L` forwards it describes (see |sshdev-forwards|).
+---
+---Without arguments the ACTIVE session's workspace profile is used (no
+---extra round trip); with [dest] [workspace] it is resolved like the
+---other commands. `--nvim-profile` is accepted but irrelevant: the
+---forward file lives in the workspace profile, which does not depend on
+---the nvim profile.
+---@param opts table { dest?, workspace?, nvim_profile?, cfg? }
+function M.forward(opts)
+  opts = opts or {}
+  Proc.launch(function()
+    local ok, err = guard_local()
+    if not ok then
+      return Util.report_error(err)
+    end
+
+    -- fast path: the active session already knows the workspace profile
+    local info = state.info
+    if not opts.dest and not opts.workspace and info and info.remote_root then
+      local cfg = Config.get()
+      if opts.cfg then
+        cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
+      end
+      local parsed = Util.parse_dest(info.dest)
+      if not parsed then
+        return Util.report_error(('the active session destination "%s" is invalid'):format(info.dest))
+      end
+      parsed.port = info.port
+      Util.log('forward: active session profile "%s"', info.workspace_profile_key)
+      return Forward.open({
+        cfg = cfg,
+        parsed = parsed,
+        remote_root = info.remote_root,
+        workspace = info.workspace,
+        workspace_profile = info.workspace_profile,
+        workspace_profile_key = info.workspace_profile_key,
+      })
+    end
+
+    if not opts.dest and not Config.get().host then
+      return Util.notify(
+        'no active sshdev session and no destination given: connect first '
+          .. '(:SshDevConnect) or pass [dest] [workspace] to :SshDevForward',
+        vim.log.levels.ERROR
+      )
+    end
+
+    -- resolve exactly like the other commands (probe + layout)
+    local cfg, parsed, layout = prepare(opts)
+    if not cfg then
+      return
+    end
+    Util.log('forward: workspace profile "%s" for %s', layout.workspace_profile_key, layout.workspace)
+    Forward.open({
+      cfg = cfg,
+      parsed = parsed,
+      remote_root = layout.root,
+      workspace = layout.workspace,
+      workspace_profile = layout.workspace_profile,
+      workspace_profile_key = layout.workspace_profile_key,
+    })
+  end)
+end
+
 ---`:SshDevStop` — stop the remote server (saves session.vim) + tunnel.
 function M.stop()
   Proc.launch(function()
@@ -766,6 +835,7 @@ function M.stop()
       state.tunnel.kill()
       state.tunnel = nil
     end
+    Forward.kill()
     local info = state.info
     if not info then
       return Util.notify('no active sshdev session to stop (local state only)')
@@ -839,6 +909,11 @@ function M.status()
       end
     else
       lines[#lines + 1] = 'no active local session (remote servers may still be running)'
+    end
+
+    local fwd = Forward.status_line()
+    if fwd then
+      lines[#lines + 1] = fwd
     end
 
     local entries = History.list()
@@ -951,7 +1026,8 @@ function M.pick_history(opts)
 end
 
 ---Kill the local tunnel handle (VimLeavePre), except right after a
----successful :connect where the local server may stop itself.
+---successful :connect where the local server may stop itself. The user
+---forwards share the tunnel's lifecycle.
 function M.teardown_local()
   if state.attached then
     return
@@ -960,6 +1036,7 @@ function M.teardown_local()
     state.tunnel.kill()
     state.tunnel = nil
   end
+  Forward.kill()
 end
 
 ---Introspection for tests.
@@ -967,6 +1044,7 @@ function M.state()
   return {
     info = state.info and vim.deepcopy(state.info) or nil,
     tunnel_alive = state.tunnel and state.tunnel.alive or false,
+    forward = Forward.applied(),
   }
 end
 

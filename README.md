@@ -83,8 +83,8 @@ With `lazy.nvim`:
 {
   'mistgc/sshdev.nvim',
   cmd = { 'SshDevConnect', 'SshDevAttach', 'SshDevInstall', 'SshDevSync',
-          'SshDevStop', 'SshDevStatus', 'SshDevHistory', 'SshDevProfiles',
-          'SshDevLog' },
+          'SshDevStop', 'SshDevStatus', 'SshDevForward', 'SshDevHistory',
+          'SshDevProfiles', 'SshDevLog' },
   config = function()
     require('sshdev').setup({
       host = 'me@myhost',              -- default destination
@@ -120,6 +120,7 @@ With telescope (optional — enables the fuzzy pickers):
 :SshDevSync                          " re-upload config + reinstall plugins
 :SshDevStop                          " stop the server (saves session) + tunnel
 :SshDevStatus                        " session / profiles / tunnel / server report
+:SshDevForward                       " edit this workspace's port forwards
 :SshDevHistory [dest]                " remote workspace picker (client-host scoped)
 :SshDevProfiles [dest]               " list reusable nvim profiles on the remote
 :SshDevLog                           " open the log
@@ -178,6 +179,33 @@ remote scan is host-filtered, several laptops sharing one remote account never
 see or adopt each other's workspaces/session state. `<C-d>` forgets a local
 entry.
 
+### Port forwards (`:SshDevForward`)
+
+The workspace's forwards live in its remote workspace profile —
+`<workspace-profile>/forward.txt` — and are edited through a local mirror:
+
+```vim
+:SshDevForward                       " open (or create) forward.txt for edit
+```
+
+```text
+# one forward per line: <local-port> = <remote-host>:<remote-port>
+3080 = 127.0.0.1:3080
+8080 = 127.0.0.1:8080
+```
+
+Saving the buffer re-uploads the file to the workspace profile and replaces
+the running forwards with **one** detached `ssh -N` carrying a `-L` per
+line: this client's `127.0.0.1:3080/8080` reach the **server's**
+`127.0.0.1:3080/8080`. The target is resolved on the server, so
+`5432 = db.internal:5432` reaches hosts only the server can see. `#` lines
+and blank lines are ignored; an empty file stops all forwards; invalid
+lines are reported with line numbers and change nothing. The new tunnel is
+only reported as applied once it verifiably accepts connections — a failed
+start (busy port, auth) reports ssh's own error and **restores the previous
+forward set**. The forward tunnel is stopped by `:SshDevStop` and when the
+local nvim exits — reopen `:SshDevForward` and save to re-establish.
+
 ### Telescope
 
 ```vim
@@ -207,7 +235,7 @@ or `:lua require('telescope').extensions.sshdev.connections()`.
         ├── nvim-profile -> ../../nvim-profiles/<nvim-profile-key>/
         ├── nvim-profile.txt  workspace.txt  client-host
         ├── session.lua                         server-side session helper
-        ├── session.vim  last_used
+        ├── session.vim  forward.txt  last_used
         └── server.pid  server.addr  server.log
 ```
 

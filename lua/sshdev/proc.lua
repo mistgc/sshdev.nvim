@@ -189,6 +189,46 @@ function M.await_tcp_probe(host, port, settle_ms, timeout_ms)
   return coroutine.yield()
 end
 
+--- Probe whether a TCP endpoint accepts connections (a listener is there).
+---
+--- Connect-only, deliberately unlike |await_tcp_probe|: an `ssh -L` forward
+--- accepts locally even when the REMOTE target is dead, and the EOF that
+--- follows only arrives after a remote round trip, so a settle window
+--- would race it. True = the connect succeeded (the forward is installed).
+function M.await_tcp_accept(host, port, timeout_ms)
+  local co = assert(coroutine.running(), 'sshdev: await_tcp_accept() must be called from a coroutine')
+
+  local handle = uv.new_tcp()
+  if not handle then
+    return false
+  end
+  local settled = false
+  local function finish(v)
+    if settled then
+      return
+    end
+    settled = true
+    if handle and not handle:is_closing() then
+      pcall(function()
+        handle:close()
+      end)
+    end
+    resume_soon(co, v)
+  end
+
+  if timeout_ms then
+    vim.defer_fn(function()
+      finish(false)
+    end, timeout_ms)
+  end
+
+  handle:connect(host, port, function(err)
+    finish(err == nil)
+  end)
+
+  return coroutine.yield()
+end
+
 --- Start a flow function in its own coroutine with error reporting.
 function M.launch(fn)
   local co = coroutine.create(fn)

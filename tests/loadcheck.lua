@@ -21,6 +21,7 @@ local modules = {
   'sshdev.ssh',
   'sshdev.remote_scripts',
   'sshdev.bootstrap',
+  'sshdev.forward',
   'sshdev.history',
   'sshdev.picker',
   'sshdev.session',

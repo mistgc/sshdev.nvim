@@ -659,6 +659,51 @@ for d in "$DIR"/*/; do
 done
 ]]
 
+---Read the workspace profile's forward.txt (READ-ONLY) for :SshDevForward.
+---
+---Reports `SSHDEV:FORWARD=yes|no`, and on "yes" the EXACT file content
+---between `SSHDEV:BEGIN-<TOKEN>` / `SSHDEV:END-<TOKEN>` markers (TOKEN is a
+---client-generated random token, so content that happens to look like a
+---marker cannot confuse the extraction).
+---Expects $WS_PROFILE and $TOKEN from the caller.
+M.forward_fetch = [[
+set -eu
+WS_PROFILE='{{WS_PROFILE}}'
+TOKEN='{{TOKEN}}'
+FWD_FILE="$WS_PROFILE/forward.txt"
+if [ -f "$FWD_FILE" ]; then
+  printf 'SSHDEV:FORWARD=yes\n'
+  printf 'SSHDEV:BEGIN-%s\n' "$TOKEN"
+  cat "$FWD_FILE"
+  # a file without a trailing newline must not swallow the END marker --
+  # and a file WITH one must not gain a blank line per round trip
+  # ($(...) strips the newline, so only a real last byte counts)
+  if [ -n "$(tail -c 1 "$FWD_FILE" 2>/dev/null || true)" ]; then
+    printf '\n'
+  fi
+  printf 'SSHDEV:END-%s\n' "$TOKEN"
+else
+  printf 'SSHDEV:FORWARD=no\n'
+fi
+]]
+
+---Ensure the workspace profile directory exists before forward.txt is
+---scp'd into it (:SshDevForward on a workspace that was never connected).
+---Guards the path like Scripts.prepare does. Expects $ROOT and $WS_PROFILE.
+M.forward_prepare = [[
+set -eu
+ROOT='{{ROOT}}'
+WS_PROFILE='{{WS_PROFILE}}'
+
+case "$WS_PROFILE" in
+  "$ROOT"/workspace-profiles/*) ;;
+  *) printf 'SSHDEV:ERROR=bad-workspace-path\n'; exit 1 ;;
+esac
+
+mkdir -p "$WS_PROFILE"
+printf 'SSHDEV:FORWARD_DIR=ok\n'
+]]
+
 ---All templates by name, for rendering + tests.
 M._templates = {
   probe = M.probe,
@@ -670,6 +715,8 @@ M._templates = {
   stop = M.stop,
   list_workspace = M.list_workspace,
   list_nvim = M.list_nvim,
+  forward_fetch = M.forward_fetch,
+  forward_prepare = M.forward_prepare,
 }
 
 ---Shared fragments injected into several templates.

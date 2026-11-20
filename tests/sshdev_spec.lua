@@ -12,6 +12,8 @@ local Keys = require('sshdev.keys')
 local Layout = require('sshdev.layout')
 local Scripts = require('sshdev.remote_scripts')
 local Bootstrap = require('sshdev.bootstrap')
+local Ssh = require('sshdev.ssh')
+local Forward = require('sshdev.forward')
 local History = require('sshdev.history')
 local Picker = require('sshdev.picker')
 local Session = require('sshdev.session')
@@ -504,6 +506,7 @@ T.describe('layout: nvim profile / workspace profile paths', function()
   eq(l.ws_client_host_file, l.workspace_profile .. '/client-host')
   eq(l.session_file, l.workspace_profile .. '/session.vim')
   eq(l.helper_file, l.workspace_profile .. '/session.lua')
+  eq(l.forward_file, l.workspace_profile .. '/forward.txt')
   eq(l.last_used_file, l.workspace_profile .. '/last_used')
   eq(l.server_pid, l.workspace_profile .. '/server.pid')
 
@@ -629,6 +632,7 @@ local function render_all()
     RESTORE = '1',
     HELPER = layout.helper_file,
     FIND_RUNNING = Scripts.find_running,
+    TOKEN = 'feedbeef',
   }
   local rendered = {}
   for name, tpl in pairs(Scripts._templates) do
@@ -898,6 +902,193 @@ T.describe('remote scripts: listing parsers are tolerant', function()
   eq(e.nvim_profile_key, '--np--')
   eq(e.last_used, 12)
   eq(e.has_session, true)
+end)
+
+----------------------------------------------------------- forward
+
+T.describe('forward.parse: <local-port> = <remote-host>:<remote-port>', function()
+  -- the documented example: this client's 3080/8080 -> the server's
+  -- 127.0.0.1:3080 / 127.0.0.1:8080
+  local specs, errs = Forward.parse('3080 = 127.0.0.1:3080\n8080 = 127.0.0.1:8080\n')
+  eq(errs, {})
+  eq(specs, {
+    { lport = 3080, rhost = '127.0.0.1', rport = 3080 },
+    { lport = 8080, rhost = '127.0.0.1', rport = 8080 },
+  })
+
+  -- tolerance: leading/trailing whitespace, tabs, CRLF, comments, blanks
+  local s2, e2 = Forward.parse(
+    '# web dev\r\n\r\n\t3080\t=\t127.0.0.1:3080  \r\n# database\n5432 = db.internal:5432\n'
+  )
+  eq(e2, {})
+  eq(s2, {
+    { lport = 3080, rhost = '127.0.0.1', rport = 3080 },
+    { lport = 5432, rhost = 'db.internal', rport = 5432 },
+  })
+
+  -- every problem is reported with its line, nothing half-applied
+  local bad_specs, bad_errs = Forward.parse(
+    '3080 = 127.0.0.1\n'
+      .. 'abc = 1.2.3.4:80\n'
+      .. '99999 = 127.0.0.1:80\n'
+      .. '3080 = 127.0.0.1:3080\n'
+      .. 'no equals sign\n'
+      .. '0 = 127.0.0.1:9\n'
+      .. '3080 = no-host-port\n'
+  )
+  eq(#bad_specs, 1, 'only the valid line becomes a spec')
+  eq(#bad_errs, 6, 'all bad lines are reported')
+  for i, ln in ipairs({ 1, 2, 3, 5, 6, 7 }) do
+    ok(bad_errs[i]:find(('line %d'):format(ln), 1, true) ~= nil, ('error cites line %d'):format(ln))
+  end
+
+  -- duplicate local ports point at the first use
+  local dup_specs, dup_errs = Forward.parse('3080 = 127.0.0.1:3080\n3080 = 127.0.0.1:80\n')
+  eq(#dup_specs, 1)
+  eq(#dup_errs, 1)
+  ok(dup_errs[1]:find('line 2', 1, true) ~= nil, 'duplicate cites the repeated line')
+  ok(dup_errs[1]:find('line 1', 1, true) ~= nil, 'duplicate cites the first use')
+
+  -- a comment-only file (the fresh template) applies nothing
+  local none, nerr = Forward.parse('# only comments\n\n# 3080 = 127.0.0.1:3080\n')
+  eq(none, {})
+  eq(nerr, {})
+  local nspecs, nerrs = Forward.parse('')
+  eq(nspecs, {})
+  eq(nerrs, {})
+end)
+
+T.describe('forward: template and describe', function()
+  eq(Forward.describe({
+    { lport = 3080, rhost = '127.0.0.1', rport = 3080 },
+    { lport = 8080, rhost = '127.0.0.1', rport = 8080 },
+  }), '3080 -> 127.0.0.1:3080, 8080 -> 127.0.0.1:8080')
+  eq(Forward.describe(nil), '')
+
+  -- the fresh-file template must parse to ZERO forwards and ZERO errors
+  local tpl = Forward.template('me@host:2222', '/home/me/src/app')
+  local specs, errs = Forward.parse(tpl)
+  eq(specs, {})
+  eq(errs, {})
+  ok(tpl:find('# 3080 = 127.0.0.1:3080', 1, true) ~= nil, 'example forward is commented out')
+  ok(tpl:find('me@host:2222', 1, true) ~= nil, 'template names the destination')
+  ok(tpl:find('/home/me/src/app', 1, true) ~= nil, 'template names the workspace')
+
+  -- the local mirror keeps the profile key recognizable and stays in cache
+  local p = vim.fs.normalize(Forward.local_path('--laptop--home-me-src-app--'))
+  ok(p:find('/sshdev/forward/%-%-laptop%-%-home%-me%-src%-app%-%-/forward%.txt$') ~= nil,
+    'cache/sshdev/forward/<workspace-profile-key>/forward.txt')
+  ok(not pcall(Forward.local_path, '../escape'), 'path separators in a key are rejected')
+  ok(not pcall(Forward.local_path, ''), 'empty key is rejected')
+end)
+
+T.describe('forward.extract_content: marker protocol', function()
+  local token = 'feedbeef'
+  local out = 'SSHDEV:FORWARD=yes\nSSHDEV:BEGIN-feedbeef\n3080 = 127.0.0.1:3080\n# note\n8080 = 127.0.0.1:8080\nSSHDEV:END-feedbeef\n'
+  eq(Forward.extract_content(out, token), '3080 = 127.0.0.1:3080\n# note\n8080 = 127.0.0.1:8080')
+  -- a file without a trailing newline gains one
+  local nonl = 'SSHDEV:FORWARD=yes\nSSHDEV:BEGIN-feedbeef\n3080 = 127.0.0.1:3080\nSSHDEV:END-feedbeef\n'
+  eq(Forward.extract_content(nonl, token), '3080 = 127.0.0.1:3080')
+  -- a different token's markers do not confuse the extraction
+  eq(Forward.extract_content(out, 'deadbeef'), nil)
+  eq(Forward.extract_content('SSHDEV:FORWARD=no\n', token), nil)
+  eq(Forward.extract_content('garbage', token), nil)
+  eq(Forward.extract_content(nil, token), nil)
+  -- CRLF content normalizes to LF
+  local crlf = 'SSHDEV:FORWARD=yes\nSSHDEV:BEGIN-feedbeef\n3080 = 127.0.0.1:3080\r\nSSHDEV:END-feedbeef\n'
+  eq(Forward.extract_content(crlf, token), '3080 = 127.0.0.1:3080')
+end)
+
+T.describe('ssh.forward_tunnel_args: one -L per forward, dest last', function()
+  local cfg = Config.build({})
+  local parsed = { dest = 'me@host', user = 'me', host = 'host', port = 2222 }
+  local args = Ssh.forward_tunnel_args(cfg, parsed, {
+    { lport = 3080, rhost = '127.0.0.1', rport = 3080 },
+    { lport = 8080, rhost = '127.0.0.1', rport = 8080 },
+  })
+  eq(args[1], 'ssh')
+  ok(vim.tbl_contains(args, '-p'), 'the destination port is passed through')
+  ok(vim.tbl_contains(args, '2222'), 'ssh port 2222')
+  ok(vim.tbl_contains(args, '-N'), 'tunnel runs no remote command')
+  ok(vim.tbl_contains(args, 'ExitOnForwardFailure=yes'), 'a failed bind kills the tunnel, loudly')
+  ok(vim.tbl_contains(args, 'ControlMaster=no'), 'tunnels are never multiplexed')
+  local fwd = {}
+  for i, a in ipairs(args) do
+    if a == '-L' then
+      fwd[#fwd + 1] = args[i + 1]
+    end
+  end
+  eq(#fwd, 2, 'one -L per spec')
+  eq(fwd[1], '127.0.0.1:3080:127.0.0.1:3080', 'local side binds loopback')
+  eq(fwd[2], '127.0.0.1:8080:127.0.0.1:8080')
+  eq(args[#args], 'me@host', 'destination is the last argument')
+  local empty = Ssh.forward_tunnel_args(cfg, parsed, {})
+  ok(not vim.tbl_contains(empty, '-L'), 'no -L without specs')
+  ok(vim.tbl_contains(empty, 'ExitOnForwardFailure=yes'), 'stable option order without specs')
+end)
+
+T.describe('remote scripts: forward_fetch / forward_prepare', function()
+  local rendered = render_all()
+  ok(rendered.forward_fetch:find('[ -f "$FWD_FILE" ]', 1, true) ~= nil, 'fetch is read-only')
+  ok(rendered.forward_fetch:find('SSHDEV:FORWARD=yes', 1, true) ~= nil, 'presence marker')
+  ok(rendered.forward_fetch:find("TOKEN='feedbeef'", 1, true) ~= nil, 'the token travels in a variable')
+  ok(rendered.forward_fetch:find('SSHDEV:BEGIN-%s', 1, true) ~= nil, 'begin marker uses the token')
+  ok(rendered.forward_fetch:find('SSHDEV:END-%s', 1, true) ~= nil, 'end marker uses the token')
+  ok(rendered.forward_fetch:find('tail -c 1', 1, true) ~= nil, 'a no-newline file cannot swallow the end marker')
+  ok(rendered.forward_prepare:find('mkdir -p "$WS_PROFILE"', 1, true) ~= nil, 'prepare creates the profile dir')
+  ok(rendered.forward_prepare:find('bad-workspace-path', 1, true) ~= nil, 'prepare guards the profile path like Scripts.prepare')
+  ok(rendered.forward_prepare:find('SSHDEV:FORWARD_DIR=ok', 1, true) ~= nil, 'prepare reports success')
+end)
+
+T.describe('remote scripts: forward_fetch executes against a fixture', function()
+  if vim.fn.executable('sh') ~= 1 then
+    print('  SKIP: no POSIX sh in PATH')
+    return
+  end
+  local fixture = 'tests/.tmp/fwd'
+  Util.rmrf(fixture)
+  local ws_dir = fixture .. '/workspace-profiles/--desk-1--home-me-app--'
+  Util.mkdir_p(ws_dir)
+  -- no trailing newline: the script must terminate the last line itself
+  write_file(ws_dir .. '/forward.txt', '3080 = 127.0.0.1:3080\n# web\n8080 = 127.0.0.1:8080')
+
+  local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-fwd')
+  Util.rmrf(dir)
+  local function run(name, vars)
+    local f = vim.fs.abspath(vim.fs.joinpath(dir, name .. '.sh'))
+    write_file(f, Util.render(Scripts._templates[name], vars))
+    return vim.system({ 'sh', f }, { cwd = REPO_ROOT, text = true }):wait()
+  end
+
+  local fwd_vars = { WS_PROFILE = ws_dir, TOKEN = 'feedbeef' }
+  local res = run('forward_fetch', fwd_vars)
+  eq(res.code, 0, 'forward_fetch exits 0: ' .. tostring(res.stderr))
+  eq(Forward.extract_content(res.stdout, 'feedbeef'),
+    '3080 = 127.0.0.1:3080\n# web\n8080 = 127.0.0.1:8080',
+    'exact content between the markers (final newline added)')
+
+  -- missing file: FORWARD=no, no markers
+  Util.rmrf(ws_dir)
+  local res2 = run('forward_fetch', fwd_vars)
+  eq(res2.code, 0, 'forward_fetch exits 0 without the file')
+  eq(Util.parse_keyvals(res2.stdout).FORWARD, 'no')
+  eq(Forward.extract_content(res2.stdout, 'feedbeef'), nil)
+
+  -- forward_prepare mkdirs the guarded path
+  local prep_vars = {
+    ROOT = fixture .. '/root',
+    WS_PROFILE = fixture .. '/root/workspace-profiles/--desk-1--home-me-app--',
+  }
+  local res3 = run('forward_prepare', prep_vars)
+  eq(res3.code, 0, 'forward_prepare exits 0: ' .. tostring(res3.stderr))
+  ok(Util.fs_stat(prep_vars.WS_PROFILE) ~= nil, 'profile dir created')
+  -- the guard refuses paths outside <root>/workspace-profiles
+  local res4 = run('forward_prepare', { ROOT = fixture .. '/root', WS_PROFILE = fixture .. '/elsewhere' })
+  ok(res4.code ~= 0, 'prepare refuses an unguarded path')
+  ok(tostring(res4.stdout):find('bad-workspace-path', 1, true) ~= nil, 'guard error marker')
+
+  Util.rmrf(fixture)
+  Util.rmrf(dir)
 end)
 
 ----------------------------------------------------------- bootstrap

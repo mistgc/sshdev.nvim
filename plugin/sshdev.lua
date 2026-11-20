@@ -272,6 +272,11 @@ sshdev_cmd('SshDevProfiles', 'sshdev: list reusable nvim profiles on the remote'
   require('sshdev.session').profiles({ dest = parsed.dest })
 end)
 
+---`:SshDevForward [dest] [workspace]` — edit the workspace's port forwards.
+---Saving the opened forward.txt buffer re-uploads it to the workspace
+---profile and (re)starts the forwards (see |sshdev-forwards|).
+sshdev_cmd('SshDevForward', 'sshdev: edit the port forwards of a workspace (save to apply)', session_fn('forward'))
+
 vim.api.nvim_create_user_command('SshDevLog', function()
   require('sshdev.util').open_log()
 end, { desc = 'sshdev: open the log' })

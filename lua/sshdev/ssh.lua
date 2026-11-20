@@ -7,6 +7,8 @@
 ---                     ambiguity in scp arguments).
 --- * `start_tunnel` -- a detached `ssh -N -L` job that survives nvim exiting
 ---                     (the UI attach via :connect stops the local server).
+--- * `start_forwards` -- the user port forwards of a workspace (forward.txt):
+---                     ONE detached `ssh -N` carrying a `-L` per line.
 ---
 --- All functions take the PARSED destination table from
 --- `Util.parse_dest` (with .dest / .user / .host / .port), not a raw string.
@@ -144,43 +146,30 @@ function M.upload_dir(cfg, parsed, cwd, dirname, remote_parent, timeout_s)
   return res
 end
 
----Start the local forward `ssh -N -L 127.0.0.1:lport -> 127.0.0.1:rport`.
+---Spawn a detached `ssh` tunnel job and return its handle.
 ---
----ControlMaster is explicitly disabled for the tunnel: a multiplexed
+---ControlMaster is explicitly disabled for every tunnel: a multiplexed
 ---tunnel would die together with a short-lived ControlPersist master;
----this job must live as long as the remote session does. The job runs
+---these jobs must live as long as the remote session does. They run
 ---detached from nvim so the UI attach (:connect, which stops the local
----nvim server) does not kill it.
+---nvim server) does not kill them.
 ---
----Returns a handle table { job, alive, kill(), dest, lport, rport }.
+---`meta` carries the caller-specific handle fields (dest/lport/rport for
+---the session tunnel, specs for the forward tunnel); the shared handle is
+---{ job, alive, exit_code, kill(), stderr_tail(), ...meta }.
 ---@param cfg table
 ---@param parsed table
----@param lport integer
----@param rport integer
----@return table
-function M.start_tunnel(cfg, parsed, lport, rport)
-  local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
-  vim.list_extend(args, {
-    '-N',
-    '-L',
-    ('127.0.0.1:%d:127.0.0.1:%d'):format(lport, rport),
-    '-o',
-    'ControlMaster=no',
-    '-o',
-    'ExitOnForwardFailure=yes',
-    '--',
-    parsed.dest,
-  })
+---@param args string[] full argv for the tunnel ssh
+---@param meta table
+---@return table handle
+local function spawn_detached_tunnel(cfg, parsed, args, meta)
   -- password mode: the detached ssh process authenticates through askpass
   -- (verified on Windows: detached, console-less children still run it)
   local env = Auth.env(cfg, parsed)
-  local t = {
-    dest = parsed.dest,
-    lport = lport,
-    rport = rport,
+  local t = vim.tbl_extend('keep', meta, {
     alive = false,
     stderr = {},
-  }
+  })
   function t.stderr_tail()
     return Util.tail(table.concat(t.stderr, '\n'), 8)
   end
@@ -221,7 +210,82 @@ function M.start_tunnel(cfg, parsed, lport, rport)
   return t
 end
 
+---Start the local forward `ssh -N -L 127.0.0.1:lport -> 127.0.0.1:rport`.
+---
+---Returns a handle table { job, alive, kill(), dest, lport, rport }.
+---@param cfg table
+---@param parsed table
+---@param lport integer
+---@param rport integer
+---@return table
+function M.start_tunnel(cfg, parsed, lport, rport)
+  local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
+  vim.list_extend(args, {
+    '-N',
+    '-L',
+    ('127.0.0.1:%d:127.0.0.1:%d'):format(lport, rport),
+    '-o',
+    'ControlMaster=no',
+    '-o',
+    'ExitOnForwardFailure=yes',
+    '--',
+    parsed.dest,
+  })
+  return spawn_detached_tunnel(cfg, parsed, args, {
+    dest = parsed.dest,
+    lport = lport,
+    rport = rport,
+  })
+end
+
+---argv for the user port-forward tunnel: ONE `ssh -N` carrying every `-L`
+---forward of the workspace's forward.txt. Pure (spawns nothing), so the
+---argument construction is unit-testable.
+---
+---Each spec is { lport, rhost, rport } from sshdev.forward.parse(). The
+---local side binds 127.0.0.1 (loopback only, like the session tunnel);
+---ExitOnForwardFailure makes ssh exit when a port cannot be bound instead
+---of silently dropping that one forward.
+---@param cfg table
+---@param parsed table
+---@param specs table[] { lport = integer, rhost = string, rport = integer }
+---@return string[] args
+function M.forward_tunnel_args(cfg, parsed, specs)
+  local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
+  vim.list_extend(args, { '-N', '-o', 'ControlMaster=no', '-o', 'ExitOnForwardFailure=yes' })
+  for _, s in ipairs(specs) do
+    vim.list_extend(args, {
+      '-L',
+      ('127.0.0.1:%d:%s:%d'):format(s.lport, s.rhost, s.rport),
+    })
+  end
+  vim.list_extend(args, { '--', parsed.dest })
+  return args
+end
+
+---Start the user port-forward tunnel (see |forward_tunnel_args|). All
+---forwards share ONE detached ssh process that is killed and replaced as a
+---unit whenever forward.txt is saved again.
+---
+---Returns a handle table { job, alive, kill(), dest, specs }.
+---@param cfg table
+---@param parsed table
+---@param specs table[] { lport = integer, rhost = string, rport = integer }
+---@return table
+function M.start_forwards(cfg, parsed, specs)
+  local args = M.forward_tunnel_args(cfg, parsed, specs)
+  return spawn_detached_tunnel(cfg, parsed, args, {
+    dest = parsed.dest,
+    specs = vim.deepcopy(specs),
+  })
+end
+
 ---Best-effort check whether a local TCP port is free (bind + close).
+---Accurate on POSIX; on Windows libuv binds with SO_REUSEADDR, which
+---succeeds even over another process's listener, so a "free" result is
+---no guarantee there -- the authoritative verdict for the user forwards
+---is the verified post-spawn wait (sshdev.forward), which catches
+---whatever ssh could not bind.
 ---@param port integer
 ---@return boolean
 function M.local_port_free(port)

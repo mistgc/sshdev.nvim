@@ -8,7 +8,7 @@
 ---   │   └── ...
 ---   └── workspace-profiles/--<host>--<workspace-path>--/
 ---       ├── nvim-profile -> ../../nvim-profiles/<key>
----       ├── session.lua  session.vim  server.pid ...
+---       ├── session.lua  session.vim  forward.txt  server.pid ...
 ---       └── ...
 ---
 --- This module is PURE: it derives the full layout from a remote $HOME, the
@@ -175,6 +175,7 @@ function M.build(opts)
     ws_client_host_file = Util.join_remote(wsp, 'client-host'),
     helper_file = Util.join_remote(wsp, 'session.lua'),
     session_file = Util.join_remote(wsp, 'session.vim'),
+    forward_file = Util.join_remote(wsp, 'forward.txt'),
     last_used_file = Util.join_remote(wsp, 'last_used'),
     server_pid = Util.join_remote(wsp, 'server.pid'),
     server_addr = Util.join_remote(wsp, 'server.addr'),
