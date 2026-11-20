@@ -373,6 +373,24 @@ local function run_attach(cfg, parsed, layout, rport)
   close_control_channel()
   state.control = open_control_channel(lport)
 
+  -- re-apply the workspace's persisted forwards (forward_on_connect):
+  -- async so it never delays the attach; its messages surface in the
+  -- attached UI through the control channel.
+  if cfg.forward_on_connect ~= false then
+    local finfo = state.info
+    Proc.launch(function()
+      require('sshdev.forward').apply_connect({
+        cfg = cfg,
+        parsed = parsed,
+        remote_root = finfo.remote_root,
+        workspace = finfo.workspace,
+        workspace_profile = finfo.workspace_profile,
+        workspace_profile_key = finfo.workspace_profile_key,
+        control = state.control,
+      })
+    end)
+  end
+
   Util.status('attaching to the remote server ...')
   attach_ui(cfg, ('127.0.0.1:%d'):format(lport))
   History.record(cfg, {

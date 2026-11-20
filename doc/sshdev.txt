@@ -270,6 +270,13 @@ exits (like the session tunnel; it survives a |:connect| that keeps the
 local instance alive as a UI client). forward.txt persists remotely, so
 re-establishing after a restart is one :SshDevForward + :w away.
 
+Reconnecting re-applies them for you: with `forward_on_connect`
+(default on) every :SshDevConnect / :SshDevAttach re-reads the
+workspace's forward.txt and re-starts its forwards automatically --
+no editor round trip needed. Forwards that are already listening
+(a leftover from the previous session) are kept and reported as such;
+force a clean re-apply with :SshDevForward + :w.
+
 Forwards do not depend on the nvim server: they work whether or not one
 is running, and with password authentication they use the same masked
 askpass mechanism as the tunnel (|sshdev-auth|).
@@ -420,6 +427,7 @@ Setup with defaults (all keys optional): >
 	  nvim_profile = 'auto',       -- "auto" | "--<host>-<version>-<hash8>--"
 	  session = true,              -- save <workspace-profile>/session.vim
 	  restore_session = true,      -- restore it on start
+	  forward_on_connect = true,    -- re-apply forward.txt on (re)connect
 	  ssh_bin = 'ssh', scp_bin = 'scp',
 	  ssh_args = { '-i', '~/.ssh/id_ed25519' },
 	  auth = 'auto',       -- "auto" (key first, password fallback) | "password" | "key"
@@ -473,6 +481,15 @@ excludes ~
 
 session / restore_session ~
 	See |sshdev-session|.
+
+forward_on_connect ~
+	Default true: after every :SshDevConnect / :SshDevAttach the
+	workspace's persisted forward.txt is re-read (one extra read-only
+	ssh round trip) and its forwards re-applied automatically --
+	silently does nothing without a forward.txt. Forwards whose ports
+	all already listen (leftovers from a previous session) are assumed
+	running and kept. Set false to manage forwards purely manually.
+	See |sshdev-forwards|.
 
 attach ~
 	See |sshdev-attach|.

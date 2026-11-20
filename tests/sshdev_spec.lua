@@ -302,6 +302,7 @@ T.describe('config validation: rejects', function()
     { { auth = 'bogus' }, 'bad auth' },
     { { history_limit = 0 }, 'bad history_limit' },
     { { session = 'yes' }, 'session type' },
+    { { forward_on_connect = 'yes' }, 'forward_on_connect type' },
   }
   for _, case in ipairs(bad) do
     local _, err = Config.setup(case[1])
@@ -317,6 +318,7 @@ T.describe('config.get falls back to defaults', function()
   eq(cfg.remote_root, '~/.sshdev.nvim')
   eq(cfg.nvim_version, 'auto')
   eq(cfg.session, true)
+  eq(cfg.forward_on_connect, true)
   eq(cfg.workspace_profile, nil)
 end)
 

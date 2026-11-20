@@ -57,6 +57,12 @@ M.defaults = {
   ---clean while still saving (e.g. :SshDevConnect with a fresh session).
   restore_session = true,
 
+  ---Re-apply the workspace's persisted forward.txt automatically after
+  ---:SshDevConnect / :SshDevAttach (one extra read-only ssh round trip;
+  ---silently does nothing without a forward.txt). Forwards whose ports
+  ---already listen (leftovers from a previous session) are left alone.
+  forward_on_connect = true,
+
   ---ssh/scp binaries.
   ssh_bin = 'ssh',
   scp_bin = 'scp',
@@ -260,6 +266,9 @@ function M.validate(cfg)
   end
   if type(cfg.restore_session) ~= 'boolean' then
     return 'setup: "restore_session" must be a boolean'
+  end
+  if type(cfg.forward_on_connect) ~= 'boolean' then
+    return 'setup: "forward_on_connect" must be a boolean'
   end
   if type(cfg.history) ~= 'boolean' then
     return 'setup: "history" must be a boolean'

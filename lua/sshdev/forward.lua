@@ -715,6 +715,54 @@ function M.apply(ctx)
   return replace_running(ctx, specs, report_local)
 end
 
+---Re-apply the workspace's persisted forward.txt automatically after
+---:SshDevConnect / :SshDevAttach (`forward_on_connect`). Read-only
+---fetch plus the shared replace path; silent when there is no file.
+---Outcome messages surface in the attached UI through the control
+---channel. Forwards whose ports ALL already listen are assumed to be
+---the previous session's leftovers and are left running (force a
+---re-apply with :SshDevForward + :w).
+---@param ctx table like |M.open| plus control = { ch, remote_id } | nil
+function M.apply_connect(ctx)
+  local content, failed = fetch(ctx)
+  if failed or content == nil then
+    return -- absent or unreadable: nothing to auto-apply
+  end
+  -- keep the local mirror fresh so :SshDevForward agrees with the file
+  local path = M.local_path(ctx.workspace_profile_key)
+  Util.mkdir_p(vim.fs.dirname(path))
+  local ok, werr = write_local(path, content)
+  if not ok then
+    return report_remote(ctx, ('cannot write the local forward mirror: %s'):format(tostring(werr)),
+      vim.log.levels.WARN)
+  end
+  local specs, errs = M.parse(content)
+  if #errs > 0 then
+    return report_remote(ctx,
+      ('forward.txt has %d invalid line(s) — run :SshDevForward in the '
+        .. 'session and fix them:\n  %s'):format(#errs, table.concat(errs, '\n  ')),
+      vim.log.levels.WARN)
+  end
+  if #specs == 0 then
+    return -- no forwards configured
+  end
+  local listening = 0
+  for _, s in ipairs(specs) do
+    if Proc.await_tcp_accept('127.0.0.1', s.lport, 500) then
+      listening = listening + 1
+    end
+  end
+  if listening == #specs then
+    return report_remote(ctx,
+      'forwards from forward.txt are already listening (kept from a '
+        .. 'previous session); :SshDevForward + :w forces a re-apply',
+      vim.log.levels.INFO)
+  end
+  return replace_running(ctx, specs, function(msg, level)
+    report_remote(ctx, msg, level)
+  end)
+end
+
 ---REMOTELY-triggered apply: forward.txt was saved inside the ATTACHED
 ---remote nvim (M.open_remote pushed the request over the control
 ---channel). The remote copy is already the source of truth -- there is
@@ -722,8 +770,7 @@ end
 ---:SshDevForward agrees with it), parse, and replace. Outcome messages
 ---are reported back into the remote UI.
 ---@param ctx table like |M.open| plus control = { ch, remote_id }
-function M.apply_remote(ctx)
-  local content, failed = fetch(ctx)
+function M.apply_remote(ctx)  local content, failed = fetch(ctx)
   if failed then
     return report_remote(ctx, ('the client could not re-read forward.txt on %s; '
       .. 'nothing was changed'):format(Util.format_dest(ctx.parsed)), vim.log.levels.ERROR)

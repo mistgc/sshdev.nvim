@@ -212,6 +212,12 @@ remote nvim, where `:SshDevForward` opens the very same forward.txt (it lives
 on the server) and each save is pushed over an RPC control channel to the
 client, which applies it and reports the outcome back into the attached UI.
 
+Reconnecting re-applies them for you: with `forward_on_connect` (default on)
+every `:SshDevConnect`/`:SshDevAttach` re-reads the workspace's forward.txt and
+re-starts its forwards automatically; already-listening leftovers from a
+previous session are kept (force a clean re-apply with `:SshDevForward` +
+`:w`).
+
 ### Telescope
 
 ```vim
