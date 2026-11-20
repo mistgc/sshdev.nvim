@@ -206,6 +206,12 @@ start (busy port, auth) reports ssh's own error and **restores the previous
 forward set**. The forward tunnel is stopped by `:SshDevStop` and when the
 local nvim exits — reopen `:SshDevForward` and save to re-establish.
 
+**Inside the attached session** (`:SshDevConnect` with the default
+`attach = "auto"`) the same command just works: the typed command runs in the
+remote nvim, where `:SshDevForward` opens the very same forward.txt (it lives
+on the server) and each save is pushed over an RPC control channel to the
+client, which applies it and reports the outcome back into the attached UI.
+
 ### Telescope
 
 ```vim

@@ -27,6 +27,14 @@
 ---             verifiably accepts connections (a dead start rolls the
 ---             previous set back and reports ssh's own error).
 ---
+---   Inside the ATTACHED remote session (the default :connect attach
+---   makes the typed command run in the REMOTE nvim), the command opens
+---   the very same file THERE (it lives on that host) and every save
+---   pushes an apply request back to the CLIENT through an RPC control
+---   channel (SSHDEV_CONTROL_CHANNEL, opened by sshdev.session at
+---   attach time): the client re-reads the file, replaces the tunnel
+---   and reports the outcome back into the remote UI.
+---
 --- The local copy is only the EDITING MEDIUM; the remote file is the
 --- source of truth and is re-uploaded on every save. One forward tunnel
 --- handle is kept per nvim instance (the plugin is single-session), and
@@ -103,15 +111,19 @@ end
 
 ---Content for a NEW forward.txt. Every line is commented out, so saving
 ---the fresh template applies nothing; parse(template(...)) must stay
----{ } / { }.
----@param dest string display destination ("me@host[:port]")
+---{ } / { }. A nil/empty `dest` omits the destination line (the remote
+---side does not know the client's destination string).
+---@param dest string|nil display destination ("me@host[:port]")
 ---@param workspace string remote workspace path
 ---@return string
 function M.template(dest, workspace)
+  local head = { '# sshdev port forwards' }
+  if dest and dest ~= '' then
+    head[#head + 1] = ('# destination: %s'):format(dest)
+  end
+  head[#head + 1] = ('# workspace:   %s'):format(workspace)
   return ([[
-# sshdev port forwards
-# destination: %s
-# workspace:   %s
+%s
 #
 # One forward per line:  <local-port> = <remote-host>:<remote-port>
 # The local port is opened on THIS machine (loopback only); the target
@@ -124,7 +136,7 @@ function M.template(dest, workspace)
 #
 # Saving this file uploads it to the remote workspace profile and
 # (re)starts the forwards; comment out or delete lines to stop them.
-]]):format(dest, workspace)
+]]):format(table.concat(head, '\n'))
 end
 
 ---Extract the exact forward.txt content reported by the forward_fetch
@@ -475,7 +487,8 @@ end
 ---@param ctx table
 ---@param old table? the previous handle
 ---@param was_alive boolean it was alive when this save started
-local function rollback(ctx, old, was_alive)
+---@param report fun(msg: string, level: integer)
+local function rollback(ctx, old, was_alive, report)
   if not old or not was_alive or not old.specs or #old.specs == 0 then
     return
   end
@@ -487,7 +500,7 @@ local function rollback(ctx, old, was_alive)
   local verdict = await_up(ctx, handle, old.specs[1].lport)
   if verdict == 'up' then
     Util.log('rolled back to the previous forwards: %s', M.describe(old.specs))
-    Util.notify('previous forwards restored: ' .. M.describe(old.specs), vim.log.levels.WARN)
+    report('previous forwards restored: ' .. M.describe(old.specs), vim.log.levels.WARN)
     return
   end
   if verdict == 'dead' and applied == handle then
@@ -498,6 +511,141 @@ local function rollback(ctx, old, was_alive)
   -- 'stale': a newer flow owns the state; 'timeout': left registered,
   -- the status tells the truth either way.
   Util.log('rollback verdict: %s', verdict)
+end
+
+---Report a message to the user of a LOCAL save flow: errors go through
+---Util.report_error (log + notification), everything else as a plain
+---notification. Messages arrive WITHOUT the "[sshdev]" prefix.
+local function report_local(msg, level)
+  if level >= vim.log.levels.ERROR then
+    Util.report_error(msg)
+  else
+    Util.notify(msg, level)
+  end
+end
+
+---Report into the ATTACHED remote UI through the control channel: while
+---the UI is attached to the remote server this nvim is headless, so the
+---remote's UI is the only visible surface. Falls back to the log when
+---the channel is gone. Messages arrive WITHOUT the "[sshdev]" prefix
+---(it is added here so the remote notification looks native).
+---@param ctx table ctx.control = { ch, remote_id } | nil
+---@param msg string
+---@param level integer
+local function report_remote(ctx, msg, level)
+  Util.log('%s', msg)
+  if not ctx.control then
+    return
+  end
+  local ok = pcall(vim.fn.rpcnotify, ctx.control.ch, 'nvim_exec_lua',
+    'local m, l = ...; vim.notify(m, l or vim.log.levels.INFO)', { '[sshdev] ' .. msg, level })
+  if not ok then
+    Util.log('control channel lost while reporting')
+  end
+end
+
+---Replace the running forward set. Shared by the LOCAL save flow
+---(M.apply) and the REMOTE-triggered apply (M.apply_remote): ports are
+---checked before the old tunnel is killed (an error leaves it running;
+---ports held by our own live handle are expected), the new tunnel is
+---verified before success is reported, and a dead start restores the
+---previous set. `report` receives the raw message + level and decides
+---where it surfaces.
+---@param ctx table
+---@param specs table[]
+---@param report fun(msg: string, level: integer)
+local function replace_running(ctx, specs, report)
+  -- the bind check is best-effort (on Windows libuv binds with SO_REUSEADDR
+  -- and succeeds over a foreign listener); the authoritative verdict is the
+  -- verified wait below, not this check.
+  local old = applied
+  local old_was_alive = old and old.alive or false
+  local busy = {}
+  for _, s in ipairs(specs) do
+    -- a port held by our own LIVE handle is expected: the kill below frees it
+    local ours = false
+    if old and old.alive then
+      for _, o in ipairs(old.specs or {}) do
+        if o.lport == s.lport then
+          ours = true
+          break
+        end
+      end
+    end
+    if not ours and not Ssh.local_port_free(s.lport) then
+      busy[#busy + 1] = tostring(s.lport)
+    end
+  end
+  if #busy > 0 then
+    return report(('cannot forward: local port(s) %s already in use '
+      .. '(a leftover ssh from a crashed nvim may hold one; check with '
+      .. '"ss -ltn" / "netstat -an"). The previous forwards keep running.'):format(
+      table.concat(busy, ', ')
+    ), vim.log.levels.ERROR)
+  end
+
+  M.kill()
+  if #specs == 0 then
+    return report('forward.txt saved: no forwards configured (previous forwards stopped)',
+      vim.log.levels.INFO)
+  end
+
+  -- give our own just-killed listener sockets a moment to close
+  Proc.sleep(200)
+  local handle = Ssh.start_forwards(ctx.cfg, ctx.parsed, specs)
+  applied = handle
+
+  local verdict = await_up(ctx, handle, specs[1].lport)
+  if verdict == 'stale' then
+    -- a newer save (or :SshDevStop / nvim exiting) replaced this tunnel
+    -- mid-flight: it owns the state now, this flow bows out silently
+    -- (its handle was killed by whoever took over).
+    return
+  end
+
+  if verdict == 'up' then
+    Util.log('forwards up on %s: %s', ctx.parsed.dest, M.describe(specs))
+    report(('forwards applied (%s): %s'):format(Util.format_dest(ctx.parsed), M.describe(specs)),
+      vim.log.levels.INFO)
+    -- A very slow link can deliver the bind failure only AFTER the probe
+    -- and its grace window passed; keep watching a few more seconds and
+    -- correct the verdict (rollback + ssh's own message) if so. A newer
+    -- flow taking over ends this silently.
+    local watch = uv.now() + 10000
+    while uv.now() < watch do
+      if applied ~= handle then
+        return
+      end
+      if not handle.alive then
+        applied = nil
+        rollback(ctx, old, old_was_alive, report)
+        return report(('the forward tunnel to %s died right after the start (exit %s):\n%s'):format(
+          ctx.parsed.dest,
+          tostring(handle.exit_code or '?'),
+          handle.stderr_tail()
+        ), vim.log.levels.ERROR)
+      end
+      Proc.sleep(250)
+    end
+    return
+  end
+
+  if verdict == 'timeout' then
+    -- not answering yet, but not dead either (very slow link): leave it
+    -- running and registered; :SshDevStatus tells the truth either way.
+    return report(('the forwards on %s did not answer within %ds — still starting? '
+      .. 'check :SshDevStatus'):format(ctx.parsed.dest, ctx.cfg.timeouts.attach), vim.log.levels.WARN)
+  end
+
+  -- verdict == 'dead': definitive failure. Restore the previous set (this
+  -- save killed it) and report ssh's own error message.
+  applied = nil
+  rollback(ctx, old, old_was_alive, report)
+  return report(('the forward tunnel to %s died (exit %s):\n%s'):format(
+    ctx.parsed.dest,
+    tostring(handle.exit_code or '?'),
+    handle.stderr_tail()
+  ), vim.log.levels.ERROR)
 end
 
 ---Apply the saved forward.txt: parse it, scp it back into the workspace
@@ -564,103 +712,162 @@ function M.apply(ctx)
   end
   Util.log('forward.txt uploaded to %s', remote_file)
 
-  -- Replace the running forwards. Port availability is checked BEFORE the
-  -- old tunnel is killed (so an error leaves it running); ports held by
-  -- our own live handle are expected and skipped. The bind check is
-  -- best-effort (on Windows libuv binds with SO_REUSEADDR and succeeds
-  -- over a foreign listener), so the authoritative verdict is the
-  -- verified wait below, not this check.
-  local old = applied
-  local old_was_alive = old and old.alive or false
-  local busy = {}
-  for _, s in ipairs(specs) do
-    -- a port held by our own LIVE handle is expected: the kill below frees it
-    local ours = false
-    if old and old.alive then
-      for _, o in ipairs(old.specs or {}) do
-        if o.lport == s.lport then
-          ours = true
-          break
-        end
-      end
-    end
-    if not ours and not Ssh.local_port_free(s.lport) then
-      busy[#busy + 1] = tostring(s.lport)
-    end
+  return replace_running(ctx, specs, report_local)
+end
+
+---REMOTELY-triggered apply: forward.txt was saved inside the ATTACHED
+---remote nvim (M.open_remote pushed the request over the control
+---channel). The remote copy is already the source of truth -- there is
+---nothing to upload; fetch it into the local mirror (so a later local
+---:SshDevForward agrees with it), parse, and replace. Outcome messages
+---are reported back into the remote UI.
+---@param ctx table like |M.open| plus control = { ch, remote_id }
+function M.apply_remote(ctx)
+  local content, failed = fetch(ctx)
+  if failed then
+    return report_remote(ctx, ('the client could not re-read forward.txt on %s; '
+      .. 'nothing was changed'):format(Util.format_dest(ctx.parsed)), vim.log.levels.ERROR)
   end
-  if #busy > 0 then
-    return fail(('cannot forward: local port(s) %s already in use '
-      .. '(a leftover ssh from a crashed nvim may hold one; check with '
-      .. '"ss -ltn" / "netstat -an"). The previous forwards keep running.'):format(
-      table.concat(busy, ', ')
-    ))
+  if content == nil then
+    content = '' -- the file vanished remotely: treat it as "no forwards"
+  end
+  local path = M.local_path(ctx.workspace_profile_key)
+  -- the mirror dir may not exist yet: this flow runs without the local
+  -- :SshDevForward ever having opened the editor in this nvim
+  Util.mkdir_p(vim.fs.dirname(path))
+  local ok, werr = write_local(path, content)
+  if not ok then
+    return report_remote(ctx, ('cannot write the local forward mirror: %s'):format(tostring(werr)),
+      vim.log.levels.ERROR)
+  end
+  local specs, errs = M.parse(content)
+  if #errs > 0 then
+    return report_remote(ctx,
+      ('forward.txt has %d invalid line(s) — nothing was applied:\n  %s'):format(
+        #errs,
+        table.concat(errs, '\n  ')
+      ), vim.log.levels.ERROR)
+  end
+  ctx.remote_missing = false
+  return replace_running(ctx, specs, function(msg, level)
+    report_remote(ctx, msg, level)
+  end)
+end
+
+-----------------------------------------------------------------------
+-- Remote-side editor (runs INSIDE the attached sshdev remote nvim)
+-----------------------------------------------------------------------
+
+local function file_exists(path)
+  local st = uv.fs_stat(path)
+  return st ~= nil and st.type == 'file'
+end
+
+---First line of a small text file (workspace.txt metadata), or nil.
+local function read_first_line(path)
+  local fd = uv.fs_open(path, 'r', 438)
+  if not fd then
+    return nil
+  end
+  local data = ''
+  local st = uv.fs_fstat(fd)
+  if st and st.size > 0 then
+    data = uv.fs_read(fd, st.size, 0) or ''
+  end
+  uv.fs_close(fd)
+  return (data:match('^[^\r\n]*'))
+end
+
+---REMOTE side of :SshDevForward, for the session the UI is ATTACHED to.
+---
+---The forward tunnels bind ports on the CLIENT machine, so they can only
+---be started there -- but forward.txt lives on THIS host, so editing it
+---here is natural. On every save the remote pushes an apply request
+---through the control channel the client opened when it attached
+---(sshdev.session announces SSHDEV_CONTROL_CHANNEL); the client then
+---re-reads this very file, applies it, and reports the outcome back
+---into this UI.
+---
+---Falls back to :detach guidance when the control channel is absent
+---(client plugin too old, or the announce was lost).
+---@param profile string workspace profile dir ($SSHDEV_WORKSPACE_PROFILE)
+function M.open_remote(profile)
+  -- POSIX-absolute on the remote; drive-letter paths are accepted so the
+  -- same code runs in local tests on Windows
+  local absolute = type(profile) == 'string' and profile ~= ''
+    and (profile:sub(1, 1) == '/' or profile:match('^%a:[/\\]') ~= nil)
+  if not absolute then
+    return Util.notify('this sshdev remote has no workspace profile; nothing to edit', vim.log.levels.WARN)
   end
 
-  M.kill()
-  if #specs == 0 then
-    return Util.notify('forward.txt saved: no forwards configured (previous forwards stopped)')
-  end
-
-  -- give our own just-killed listener sockets a moment to close
-  Proc.sleep(200)
-  local handle = Ssh.start_forwards(ctx.cfg, ctx.parsed, specs)
-  applied = handle
-
-  local verdict = await_up(ctx, handle, specs[1].lport)
-  if verdict == 'stale' then
-    -- a newer save (or :SshDevStop / nvim exiting) replaced this tunnel
-    -- mid-flight: it owns the state now, this flow bows out silently
-    -- (its handle was killed by whoever took over).
-    return
-  end
-
-  if verdict == 'up' then
-    Util.log('forwards up on %s: %s', ctx.parsed.dest, M.describe(specs))
-    Util.notify(
-      ('forwards applied (%s): %s'):format(Util.format_dest(ctx.parsed), M.describe(specs))
-    )
-    -- A very slow link can deliver the bind failure only AFTER the probe
-    -- and its grace window passed; keep watching a few more seconds and
-    -- correct the verdict (rollback + ssh's own message) if so. A newer
-    -- flow taking over ends this silently.
-    local watch = uv.now() + 10000
-    while uv.now() < watch do
-      if applied ~= handle then
-        return
-      end
-      if not handle.alive then
-        applied = nil
-        rollback(ctx, old, old_was_alive)
-        return fail(('the forward tunnel to %s died right after the start (exit %s):\n%s'):format(
-          ctx.parsed.dest,
-          tostring(handle.exit_code or '?'),
-          handle.stderr_tail()
-        ))
-      end
-      Proc.sleep(250)
-    end
-    return
-  end
-
-  if verdict == 'timeout' then
-    -- not answering yet, but not dead either (very slow link): leave it
-    -- running and registered; :SshDevStatus tells the truth either way.
+  if type(_G.SSHDEV_CONTROL_CHANNEL) ~= 'number' then
     return Util.notify(
-      ('the forwards on %s did not answer within %ds — still starting? '
-        .. 'check :SshDevStatus'):format(ctx.parsed.dest, ctx.cfg.timeouts.attach),
+      'this is the sshdev remote server and the client control channel is not '
+        .. 'available: manage the forwards from the client -- :detach (exits '
+        .. 'this UI; the server keeps running), then in a NEW local nvim '
+        .. ':SshDevForward + :w, and :SshDevAttach to return',
       vim.log.levels.WARN
     )
   end
 
-  -- verdict == 'dead': definitive failure. Restore the previous set (this
-  -- save killed it) and report ssh's own error message.
-  applied = nil
-  rollback(ctx, old, old_was_alive)
-  return fail(('the forward tunnel to %s died (exit %s):\n%s'):format(
-    ctx.parsed.dest,
-    tostring(handle.exit_code or '?'),
-    handle.stderr_tail()
-  ))
+  local workspace = read_first_line(Util.join_remote(profile, 'workspace.txt')) or '(unknown)'
+  local path = Util.join_remote(profile, 'forward.txt')
+
+  -- a fresh file gets the all-commented template; the file is LOCAL to
+  -- this host, so creating it needs no ssh round trip.
+  if not file_exists(path) then
+    local fd, err = uv.fs_open(path, 'w', 438)
+    if not fd then
+      return Util.notify(('cannot create %s: %s'):format(path, tostring(err)), vim.log.levels.ERROR)
+    end
+    uv.fs_write(fd, M.template(nil, workspace), 0)
+    uv.fs_close(fd)
+    Util.log('created the remote forward.txt template for %s', workspace)
+  end
+
+  local buf = find_buf(path)
+  buf = open_window(path, buf)
+  if not buf then
+    return Util.notify(('cannot open a window on %s'):format(path), vim.log.levels.ERROR)
+  end
+
+  pcall(vim.api.nvim_buf_set_var, buf, 'sshdev_forward', {
+    workspace = workspace,
+    remote = true,
+  })
+
+  -- every save pushes a CLIENT-side apply through the control channel
+  local group = vim.api.nvim_create_augroup(('sshdev-forward-%d'):format(buf), { clear = true })
+  vim.api.nvim_create_autocmd('BufWritePost', {
+    group = group,
+    buffer = buf,
+    callback = function()
+      -- re-read the id each time: the client re-announces on every attach
+      local ch = _G.SSHDEV_CONTROL_CHANNEL
+      if type(ch) ~= 'number' then
+        return Util.notify(
+          'forward.txt saved, but the client control channel is gone: apply it '
+            .. 'from the client (:detach exits this UI; in a NEW local nvim run '
+            .. ':SshDevForward + :w, then :SshDevAttach)',
+          vim.log.levels.WARN
+        )
+      end
+      local ok = pcall(vim.fn.rpcnotify, ch, 'nvim_exec_lua',
+        'require("sshdev.session")._remote_forward_apply(select(1, ...))', { profile })
+      if ok then
+        Util.notify('forward.txt saved — the client is applying it; the outcome is reported shortly')
+      else
+        Util.notify(
+          'forward.txt saved, but the client could not be reached: apply it '
+            .. 'from the client (:detach exits this UI; in a NEW local nvim run '
+            .. ':SshDevForward + :w, then :SshDevAttach)',
+          vim.log.levels.WARN
+        )
+      end
+    end,
+  })
+
+  Util.notify(('editing port forwards of "%s" (remote) — save the buffer (:w) to apply'):format(workspace))
 end
 
 return M

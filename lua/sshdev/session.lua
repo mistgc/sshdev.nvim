@@ -39,6 +39,7 @@ local M = {}
 local state = {
   info = nil, -- { dest, port, workspace, workspace_profile, workspace_profile_key, nvim_profile, nvim_profile_key, remote_root, lport, rport }
   tunnel = nil, -- ssh tunnel handle (only when WE started it)
+  control = nil, -- RPC control channel to the remote server (remote pushes client-side actions)
   attached = false, -- a :connect was issued from this session
 }
 
@@ -250,6 +251,46 @@ local function attach_ui(cfg, addr)
   Util.log('attach command: %s', cmd)
 end
 
+---Open the RPC control channel to the remote server through the tunnel
+---and announce our channel id (`_G.SSHDEV_CONTROL_CHANNEL` on the remote).
+---The remote uses it to push CLIENT-side actions for commands typed
+---inside the attached session (the forward.txt apply of |:SshDevForward|):
+---"remote -> rpcnotify -> nvim_exec_lua" runs in THIS nvim even while its
+---UI is attached to the remote. Best-effort: nil when unavailable.
+---@param lport integer local tunnel port
+---@return table? control { ch, remote_id }
+local function open_control_channel(lport)
+  local addr = ('127.0.0.1:%d'):format(lport)
+  local ok, ch = pcall(vim.fn.sockconnect, 'tcp', addr, { rpc = true })
+  if not ok or type(ch) ~= 'number' or ch <= 0 then
+    Util.log('control channel to %s unavailable (%s)', addr, tostring(ch))
+    return nil
+  end
+  local iok, info = pcall(vim.fn.rpcrequest, ch, 'nvim_get_api_info')
+  if not iok or type(info) ~= 'table' or type(info[1]) ~= 'number' then
+    Util.log('control channel handshake on %s failed', addr)
+    pcall(vim.fn.chanclose, ch)
+    return nil
+  end
+  -- tell the remote which of ITS channel ids reaches us
+  local aok = pcall(vim.fn.rpcnotify, ch, 'nvim_exec_lua',
+    '_G.SSHDEV_CONTROL_CHANNEL = select(1, ...)', { info[1] })
+  if not aok then
+    pcall(vim.fn.chanclose, ch)
+    return nil
+  end
+  Util.log('control channel up: the remote reaches us as channel %d', info[1])
+  return { ch = ch, remote_id = info[1] }
+end
+
+---Close the control channel (detach/stop/teardown/re-open).
+local function close_control_channel()
+  if state.control then
+    pcall(vim.fn.chanclose, state.control.ch)
+    state.control = nil
+  end
+end
+
 ---Open the tunnel (or reuse an existing one) and attach.
 ---Must run inside a flow coroutine.
 local function run_attach(cfg, parsed, layout, rport)
@@ -323,6 +364,15 @@ local function run_attach(cfg, parsed, layout, rport)
   end
 
   Util.log('tunnel up: 127.0.0.1:%d -> %s:127.0.0.1:%d', lport, parsed.dest, rport)
+
+  -- RPC control channel to the remote server: commands typed INSIDE the
+  -- attached remote session (e.g. :SshDevForward's forward.txt save) push
+  -- client-side actions through it ("remote -> rpcnotify -> nvim_exec_lua"
+  -- runs in THIS nvim, whose UI is attached to the remote). Best-effort:
+  -- the remote falls back to :detach guidance when it is unavailable.
+  close_control_channel()
+  state.control = open_control_channel(lport)
+
   Util.status('attaching to the remote server ...')
   attach_ui(cfg, ('127.0.0.1:%d'):format(lport))
   History.record(cfg, {
@@ -773,6 +823,12 @@ end
 ---@param opts table { dest?, workspace?, nvim_profile?, cfg? }
 function M.forward(opts)
   opts = opts or {}
+  -- The UI is ATTACHED to the remote server: the typed command runs in
+  -- the REMOTE nvim, and forward.txt lives on that host -- open it there;
+  -- its saves are applied CLIENT-side through the control channel.
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return Forward.open_remote(vim.env.SSHDEV_WORKSPACE_PROFILE)
+  end
   Proc.launch(function()
     local ok, err = guard_local()
     if not ok then
@@ -827,6 +883,44 @@ function M.forward(opts)
   end)
 end
 
+---Client-side receiver for a REMOTE-triggered apply: forward.txt was saved
+---inside the ATTACHED remote nvim (this nvim's UI is attached to it, so
+---the user edits the file in the remote session); the remote pushed the
+---request through the control channel. Only the workspace of THIS
+---session's tunnel is honored -- anything else (stale announce from an
+---old session, another workspace's profile) is ignored.
+---@param profile string workspace profile dir the remote reported
+function M._remote_forward_apply(profile)
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return -- never execute in the remote server itself
+  end
+  local info = state.info
+  if not info or not state.control then
+    return
+  end
+  if type(profile) ~= 'string' or profile ~= info.workspace_profile then
+    Util.log('ignoring a remote forward apply for %s', tostring(profile))
+    return
+  end
+  local cfg = Config.get()
+  local parsed = Util.parse_dest(info.dest)
+  if not parsed then
+    return
+  end
+  parsed.port = info.port
+  Proc.launch(function()
+    require('sshdev.forward').apply_remote({
+      cfg = cfg,
+      parsed = parsed,
+      remote_root = info.remote_root,
+      workspace = info.workspace,
+      workspace_profile = info.workspace_profile,
+      workspace_profile_key = info.workspace_profile_key,
+      control = state.control,
+    })
+  end)
+end
+
 ---`:SshDevStop` — stop the remote server (saves session.vim) + tunnel.
 function M.stop()
   Proc.launch(function()
@@ -835,6 +929,7 @@ function M.stop()
       state.tunnel.kill()
       state.tunnel = nil
     end
+    close_control_channel()
     Forward.kill()
     local info = state.info
     if not info then
@@ -1027,7 +1122,7 @@ end
 
 ---Kill the local tunnel handle (VimLeavePre), except right after a
 ---successful :connect where the local server may stop itself. The user
----forwards share the tunnel's lifecycle.
+---forwards and the control channel share the tunnel's lifecycle.
 function M.teardown_local()
   if state.attached then
     return
@@ -1036,6 +1131,7 @@ function M.teardown_local()
     state.tunnel.kill()
     state.tunnel = nil
   end
+  close_control_channel()
   Forward.kill()
 end
 

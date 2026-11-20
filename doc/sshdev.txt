@@ -133,7 +133,10 @@ COMMANDS						*sshdev-commands*
 	forwards. Invalid lines are reported with their line numbers and
 	change nothing. Without arguments the ACTIVE session's workspace
 	profile is used; [dest] [workspace] resolve it like
-	:SshDevConnect. See |sshdev-forwards|.
+	:SshDevConnect. Inside the ATTACHED remote session the command
+	opens the same file in the attached UI and every save is applied
+	client-side over an RPC control channel (see |sshdev-forwards-attached|).
+	See |sshdev-forwards|.
 
 *:SshDevLog*
 :SshDevLog			Open the sshdev log buffer.
@@ -270,6 +273,28 @@ re-establishing after a restart is one :SshDevForward + :w away.
 Forwards do not depend on the nvim server: they work whether or not one
 is running, and with password authentication they use the same masked
 askpass mechanism as the tunnel (|sshdev-auth|).
+
+INSIDE THE ATTACHED SESSION					*sshdev-forwards-attached*
+
+With the default "connect" attach, commands typed after
+|:SshDevConnect| run in the REMOTE nvim -- and `:SshDevForward` works
+there too: the forward file lives on that host, so it opens in the
+attached UI, and every save is pushed to the CLIENT over an RPC control
+channel that the client opened at attach time
+(`SSHDEV_CONTROL_CHANNEL` on the remote). The client (headless behind
+the attached UI) re-reads the file, replaces the forward tunnel and
+reports the outcome back into the attached UI -- the whole loop stays
+in one editor. The fallback, when the control channel is unavailable
+(e.g. the client runs an older plugin): >
+	:detach		exits the UI (the server keeps running)
+	<SshDevForward + :w in a NEW local nvim>
+	:SshDevAttach	return to the session
+<
+Note that while the UI is attached, the local nvim process IS the
+remote's UI client: when it exits, the forwards and the tunnel keep
+running detached. A save from a NEW nvim then reports their ports as
+busy until the leftover ssh is killed ("netstat -an" / "ss -ltn" show
+the pid), or until :SshDevAttach reuses the session.
 
 Local listeners bind loopback only -- nothing is exposed to the network.
 

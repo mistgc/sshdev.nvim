@@ -25,6 +25,8 @@ local Scripts = require('sshdev.remote_scripts')
 local Ssh = require('sshdev.ssh')
 local Util = require('sshdev.util')
 
+local uv = vim.uv or vim.loop
+
 local M = {}
 
 -----------------------------------------------------------------------
@@ -294,6 +296,14 @@ function M.upload_helper(cfg, parsed, layout)
   local root = Util.plugin_root()
   if not root then
     return nil, 'cannot locate the sshdev.nvim plugin directory'
+  end
+  -- a clear message instead of jobstart's cryptic E475 when a vendored or
+  -- partial installation lacks the helper next to lua/
+  local helper = Util.fs_join(root, 'scripts', 'remote_session.lua')
+  local st = uv.fs_stat(helper)
+  if not st or st.type ~= 'file' then
+    return nil, ('cannot find scripts/remote_session.lua under %s; '
+      .. 'is the sshdev.nvim installation complete?'):format(root)
   end
   local res = Ssh.upload_file(
     cfg,

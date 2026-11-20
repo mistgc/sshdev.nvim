@@ -974,6 +974,14 @@ T.describe('forward: template and describe', function()
   ok(tpl:find('me@host:2222', 1, true) ~= nil, 'template names the destination')
   ok(tpl:find('/home/me/src/app', 1, true) ~= nil, 'template names the workspace')
 
+  -- the REMOTE side has no client destination string: omit that line
+  local rtl = Forward.template(nil, '/home/me/app')
+  local rs, re_ = Forward.parse(rtl)
+  eq(#rs, 0)
+  eq(#re_, 0)
+  ok(not rtl:find('destination:', 1, true), 'nil dest omits the destination line')
+  ok(rtl:find('# workspace:   /home/me/app', 1, true) ~= nil, 'workspace line kept')
+
   -- the local mirror keeps the profile key recognizable and stays in cache
   local p = vim.fs.normalize(Forward.local_path('--laptop--home-me-src-app--'))
   ok(p:find('/sshdev/forward/%-%-laptop%-%-home%-me%-src%-app%-%-/forward%.txt$') ~= nil,
@@ -1081,7 +1089,7 @@ T.describe('remote scripts: forward_fetch executes against a fixture', function(
   }
   local res3 = run('forward_prepare', prep_vars)
   eq(res3.code, 0, 'forward_prepare exits 0: ' .. tostring(res3.stderr))
-  ok(Util.fs_stat(prep_vars.WS_PROFILE) ~= nil, 'profile dir created')
+  ok(uv.fs_stat(prep_vars.WS_PROFILE) ~= nil, 'profile dir created')
   -- the guard refuses paths outside <root>/workspace-profiles
   local res4 = run('forward_prepare', { ROOT = fixture .. '/root', WS_PROFILE = fixture .. '/elsewhere' })
   ok(res4.code ~= 0, 'prepare refuses an unguarded path')
@@ -1089,6 +1097,104 @@ T.describe('remote scripts: forward_fetch executes against a fixture', function(
 
   Util.rmrf(fixture)
   Util.rmrf(dir)
+end)
+
+T.describe('forward: remote-side editor (the attached session)', function()
+  local function read_all(path)
+    local fd = assert(uv.fs_open(path, 'r', 438), 'cannot read ' .. tostring(path))
+    local st = uv.fs_fstat(fd)
+    local data = st.size > 0 and uv.fs_read(fd, st.size, 0) or ''
+    uv.fs_close(fd)
+    return data
+  end
+
+  local saved_remote = vim.env.SSHDEV_REMOTE
+  local saved_profile = vim.env.SSHDEV_WORKSPACE_PROFILE
+  local orig_notify = vim.notify
+  local seen = nil
+  local function notify_spy()
+    seen = nil
+    vim.notify = function(msg, level)
+      seen = { msg = msg, level = level }
+    end
+  end
+
+  local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-fwd-remote')
+  local ws = vim.fs.joinpath(dir, 'workspace-profiles', '--h--home-me-app--')
+
+  -- the env simulation MUST be undone even when an assertion throws, or it
+  -- leaks into every later describe
+  local okr, err = pcall(function()
+    -- simulate running inside the remote server
+    vim.env.SSHDEV_REMOTE = '1'
+
+    -- 1. no control channel: actionable guidance, not a dead end
+    _G.SSHDEV_CONTROL_CHANNEL = nil
+    vim.env.SSHDEV_WORKSPACE_PROFILE = '/root/.sshdev.nvim/workspace-profiles/--h--w--'
+    notify_spy()
+    Session.forward({})
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('client control channel is not available', 1, true) ~= nil,
+      'without a channel the guidance points at the client')
+    ok(seen and seen.msg:find(':detach', 1, true) ~= nil, 'the guidance names the workflow')
+
+    -- 2. with a channel id (dead on purpose): the editor opens REMOTELY
+    Util.rmrf(dir)
+    Util.mkdir_p(ws)
+    write_file(ws .. '/workspace.txt', '/home/me/app\n')
+    _G.SSHDEV_CONTROL_CHANNEL = 999999 -- no such channel: the push will fail
+    vim.env.SSHDEV_WORKSPACE_PROFILE = ws
+
+    notify_spy()
+    Session.forward({})
+    vim.notify = orig_notify
+    local fwd = vim.fs.joinpath(ws, 'forward.txt')
+    ok(uv.fs_stat(fwd) ~= nil, 'missing forward.txt created with the template')
+    local content = read_all(fwd)
+    ok(content:find('# workspace:   /home/me/app', 1, true) ~= nil, 'template names the workspace')
+    ok(not content:find('destination:', 1, true),
+      'no destination line (the client dest is unknown remotely)')
+    ok(seen and seen.msg:find('editing port forwards', 1, true) ~= nil, 'the open is announced')
+
+    -- the buffer is open; a save pushes through the (dead) channel
+    local buf
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b) == fwd and vim.api.nvim_buf_is_loaded(b) then
+        buf = b
+        break
+      end
+    end
+    ok(buf ~= nil, 'the forward.txt buffer is open in this session')
+    if buf then
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { '4455 = 127.0.0.1:4455' })
+      notify_spy()
+      local wok, werr = pcall(vim.cmd, 'write')
+      vim.notify = orig_notify
+      ok(seen and seen.msg:find('client could not be reached', 1, true) ~= nil,
+        'a dead control channel falls back to guidance on save')
+      ok(wok or tostring(werr):find('client could not be reached', 1, true) ~= nil,
+        'the fallback surfaces (headless may raise it through exec)')
+      eq(Forward.applied(), nil, 'a remote-side save starts no tunnel in THIS nvim')
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+
+    -- 3. a bogus profile is refused
+    notify_spy()
+    vim.env.SSHDEV_WORKSPACE_PROFILE = 'relative/path'
+    Session.forward({})
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('no workspace profile', 1, true) ~= nil,
+      'a relative profile path is refused')
+  end)
+
+  -- unconditional cleanup, even after a failed assertion
+  _G.SSHDEV_CONTROL_CHANNEL = nil
+  vim.env.SSHDEV_REMOTE = saved_remote
+  vim.env.SSHDEV_WORKSPACE_PROFILE = saved_profile
+  Util.rmrf(dir)
+  if not okr then
+    error(err, 0)
+  end
 end)
 
 ----------------------------------------------------------- bootstrap
