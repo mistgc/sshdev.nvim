@@ -176,6 +176,7 @@ function M.build(opts)
     helper_file = Util.join_remote(wsp, 'session.lua'),
     session_file = Util.join_remote(wsp, 'session.vim'),
     forward_file = Util.join_remote(wsp, 'forward.txt'),
+    env_file = Util.join_remote(wsp, 'env.txt'),
     last_used_file = Util.join_remote(wsp, 'last_used'),
     server_pid = Util.join_remote(wsp, 'server.pid'),
     server_addr = Util.join_remote(wsp, 'server.addr'),

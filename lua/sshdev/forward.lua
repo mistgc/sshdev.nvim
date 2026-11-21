@@ -142,31 +142,11 @@ end
 ---Extract the exact forward.txt content reported by the forward_fetch
 ---script between its BEGIN/END markers (the token makes marker confusion
 ---impossible). Returns nil when the markers are absent.
----
----Transport realities: Proc.await drops EMPTY lines, so blank lines never
----survive the fetch (they are semantically void to the parser anyway), and
----a content line ending in a bare \r is stripped (CRLF files normalize to
----LF). A remote file without a trailing newline gains one -- harmless,
----:w writes one anyway.
 ---@param stdout string|nil
 ---@param token string the token rendered into the script
 ---@return string? content
 function M.extract_content(stdout, token)
-  local begin_marker = 'SSHDEV:BEGIN-' .. tostring(token)
-  local end_marker = 'SSHDEV:END-' .. tostring(token)
-  local lines = {}
-  local inside = false
-  for line in tostring(stdout or ''):gmatch('[^\r\n]+') do
-    if line == begin_marker then
-      inside = true
-      lines = {}
-    elseif line == end_marker then
-      return table.concat(lines, '\n')
-    elseif inside then
-      lines[#lines + 1] = line:gsub('\r$', '')
-    end
-  end
-  return nil
+  return Util.extract_marked(stdout, token)
 end
 
 ---Local cache mirror of the workspace's forward.txt (the editing medium).

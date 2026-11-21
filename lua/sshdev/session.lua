@@ -27,6 +27,7 @@
 local Auth = require('sshdev.auth')
 local Bootstrap = require('sshdev.bootstrap')
 local Config = require('sshdev.config')
+local Env = require('sshdev.env')
 local Forward = require('sshdev.forward')
 local History = require('sshdev.history')
 local Layout = require('sshdev.layout')
@@ -373,6 +374,14 @@ local function run_attach(cfg, parsed, layout, rport)
   close_control_channel()
   state.control = open_control_channel(lport)
 
+  -- Inject the workspace environment into the server. A fresh start already
+  -- inherited it from the start script's exports; this push also covers
+  -- re-attaching to a running server and unsets variables removed from
+  -- env.txt. Skip it when env_on_connect is off and nothing was saved.
+  if cfg.env_on_connect ~= false or Env.active_for(parsed) then
+    Env.push({ control = state.control })
+  end
+
   -- re-apply the workspace's persisted forwards (forward_on_connect):
   -- async so it never delays the attach; its messages surface in the
   -- attached UI through the control channel.
@@ -603,6 +612,19 @@ local function apply_reuse(parsed, layout, info)
   return auto, info, false
 end
 
+---Read the workspace's persisted env.txt and make it the active map for
+---the rest of the flow (before ensure/install/start, so the exported
+---variables reach every remote step and the server's process environment).
+---@param cfg table
+---@param parsed table
+---@param layout table
+local function load_env(cfg, parsed, layout)
+  if cfg.env_on_connect == false then
+    return
+  end
+  Env.load(cfg, parsed, layout)
+end
+
 -----------------------------------------------------------------------
 -- Public flows
 -----------------------------------------------------------------------
@@ -612,10 +634,12 @@ end
 function M.connect(opts)
   opts = opts or {}
   Proc.launch(function()
+    Env.clear()
     local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
+    load_env(cfg, parsed, layout)
 
     Util.status(('preparing nvim %s on the remote ...'):format(layout.nvim_version))
     local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
@@ -725,10 +749,12 @@ end
 function M.install(opts)
   opts = opts or {}
   Proc.launch(function()
+    Env.clear()
     local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
+    load_env(cfg, parsed, layout)
     Util.status(('preparing nvim %s on the remote ...'):format(layout.nvim_version))
     local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
     if not info then
@@ -775,10 +801,12 @@ end
 function M.sync(opts)
   opts = opts or {}
   Proc.launch(function()
+    Env.clear()
     local cfg, parsed, layout, probe = prepare(opts)
     if not cfg then
       return
     end
+    load_env(cfg, parsed, layout)
     local info, ierr = Bootstrap.ensure(cfg, parsed, layout, probe)
     if not info then
       fail(ierr)
@@ -901,6 +929,117 @@ function M.forward(opts)
   end)
 end
 
+---`:SshDevEnv [dest] [workspace]` — edit this workspace's environment
+---variables: the `env.txt` of the workspace profile, fetched into a local
+---buffer; saving that buffer re-uploads it and injects the variables into
+---the remote server and into every ssh-run script (see |sshdev-env|).
+---
+---Without arguments the ACTIVE session's workspace profile is used (no
+---extra round trip); with [dest] [workspace] it is resolved like the
+---other commands. `--nvim-profile` is accepted but irrelevant: env.txt
+---lives in the workspace profile, which does not depend on the nvim profile.
+---@param opts table { dest?, workspace?, nvim_profile?, cfg? }
+function M.env(opts)
+  opts = opts or {}
+  -- The UI is ATTACHED to the remote server: the typed command runs in
+  -- the REMOTE nvim, and env.txt lives on that host -- open it there; its
+  -- saves are applied CLIENT-side through the control channel.
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return Env.open_remote(vim.env.SSHDEV_WORKSPACE_PROFILE)
+  end
+  Proc.launch(function()
+    local ok, err = guard_local()
+    if not ok then
+      return Util.report_error(err)
+    end
+
+    -- fast path: the active session already knows the workspace profile
+    local info = state.info
+    if not opts.dest and not opts.workspace and info and info.remote_root then
+      local cfg = Config.get()
+      if opts.cfg then
+        cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
+      end
+      local parsed = Util.parse_dest(info.dest)
+      if not parsed then
+        return Util.report_error(('the active session destination "%s" is invalid'):format(info.dest))
+      end
+      parsed.port = info.port
+      Util.log('env: active session profile "%s"', info.workspace_profile_key)
+      return Env.open({
+        cfg = cfg,
+        parsed = parsed,
+        remote_root = info.remote_root,
+        workspace = info.workspace,
+        workspace_profile = info.workspace_profile,
+        workspace_profile_key = info.workspace_profile_key,
+        control = state.control,
+      })
+    end
+
+    if not opts.dest and not Config.get().host then
+      return Util.notify(
+        'no active sshdev session and no destination given: connect first '
+          .. '(:SshDevConnect) or pass [dest] [workspace] to :SshDevEnv',
+        vim.log.levels.ERROR
+      )
+    end
+
+    -- resolve exactly like the other commands (probe + layout)
+    local cfg, parsed, layout = prepare(opts)
+    if not cfg then
+      return
+    end
+    Util.log('env: workspace profile "%s" for %s', layout.workspace_profile_key, layout.workspace)
+    Env.open({
+      cfg = cfg,
+      parsed = parsed,
+      remote_root = layout.root,
+      workspace = layout.workspace,
+      workspace_profile = layout.workspace_profile,
+      workspace_profile_key = layout.workspace_profile_key,
+      -- no control channel here: the active session may belong to another
+      -- workspace, and pushing its state would be wrong
+    })
+  end)
+end
+
+---Client-side receiver for a REMOTE-triggered env apply: env.txt was
+---saved inside the ATTACHED remote nvim; the remote pushed the request
+---through the control channel. Only the workspace of THIS session's
+---tunnel is honored.
+---@param profile string workspace profile dir the remote reported
+function M._remote_env_apply(profile)
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return -- never execute in the remote server itself
+  end
+  local info = state.info
+  if not info or not state.control then
+    return
+  end
+  if type(profile) ~= 'string' or profile ~= info.workspace_profile then
+    Util.log('ignoring a remote env apply for %s', tostring(profile))
+    return
+  end
+  local cfg = Config.get()
+  local parsed = Util.parse_dest(info.dest)
+  if not parsed then
+    return
+  end
+  parsed.port = info.port
+  Proc.launch(function()
+    Env.apply_remote({
+      cfg = cfg,
+      parsed = parsed,
+      remote_root = info.remote_root,
+      workspace = info.workspace,
+      workspace_profile = info.workspace_profile,
+      workspace_profile_key = info.workspace_profile_key,
+      control = state.control,
+    })
+  end)
+end
+
 ---Client-side receiver for a REMOTE-triggered apply: forward.txt was saved
 ---inside the ATTACHED remote nvim (this nvim's UI is attached to it, so
 ---the user edits the file in the remote session); the remote pushed the
@@ -949,6 +1088,7 @@ function M.stop()
     end
     close_control_channel()
     Forward.kill()
+    Env.clear()
     local info = state.info
     if not info then
       return Util.notify('no active sshdev session to stop (local state only)')
@@ -1027,6 +1167,11 @@ function M.status()
     local fwd = Forward.status_line()
     if fwd then
       lines[#lines + 1] = fwd
+    end
+
+    local envline = Env.status_line()
+    if envline then
+      lines[#lines + 1] = envline
     end
 
     local entries = History.list()
@@ -1151,6 +1296,7 @@ function M.teardown_local()
   end
   close_control_channel()
   Forward.kill()
+  Env.clear()
 end
 
 ---Introspection for tests.

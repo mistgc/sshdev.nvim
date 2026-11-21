@@ -98,6 +98,15 @@ function M.forward(opts)
   session().forward(opts)
 end
 
+---Open the workspace's environment-variable editor (like |:SshDevEnv|):
+---the env.txt of the workspace profile, fetched into a local buffer.
+---Saving that buffer re-uploads it and injects the variables into the
+---remote nvim server and every ssh-run script.
+---opts: { dest = "[user@]host[:port]", workspace = "remote project dir" }
+function M.env(opts)
+  session().env(opts)
+end
+
 ---Stop the remote server (saves session.vim) and the local tunnel.
 function M.stop()
   session().stop()

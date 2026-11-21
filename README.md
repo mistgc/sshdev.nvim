@@ -83,8 +83,8 @@ With `lazy.nvim`:
 {
   'mistgc/sshdev.nvim',
   cmd = { 'SshDevConnect', 'SshDevAttach', 'SshDevInstall', 'SshDevSync',
-          'SshDevStop', 'SshDevStatus', 'SshDevForward', 'SshDevHistory',
-          'SshDevProfiles', 'SshDevLog' },
+          'SshDevStop', 'SshDevStatus', 'SshDevForward', 'SshDevEnv',
+          'SshDevHistory', 'SshDevProfiles', 'SshDevLog' },
   config = function()
     require('sshdev').setup({
       host = 'me@myhost',              -- default destination
@@ -121,6 +121,7 @@ With telescope (optional — enables the fuzzy pickers):
 :SshDevStop                          " stop the server (saves session) + tunnel
 :SshDevStatus                        " session / profiles / tunnel / server report
 :SshDevForward                       " edit this workspace's port forwards
+:SshDevEnv                           " edit this workspace's environment variables
 :SshDevHistory [dest]                " remote workspace picker (client-host scoped)
 :SshDevProfiles [dest]               " list reusable nvim profiles on the remote
 :SshDevLog                           " open the log
@@ -217,6 +218,52 @@ every `:SshDevConnect`/`:SshDevAttach` re-reads the workspace's forward.txt and
 re-starts its forwards automatically; already-listening leftovers from a
 previous session are kept (force a clean re-apply with `:SshDevForward` +
 `:w`).
+
+### Environment variables (`:SshDevEnv`)
+
+The workspace's variables live next to forward.txt, in the remote workspace
+profile — `<workspace-profile>/env.txt` — and are edited through a local
+mirror:
+
+```vim
+:SshDevEnv                           " open (or create) env.txt for edit
+```
+
+```text
+# one variable per line: KEY=VALUE (values are used verbatim)
+NODE_ENV=development
+DATABASE_URL=postgres://127.0.0.1:5432/app
+PATH=/opt/tools/bin:/usr/bin:/bin
+```
+
+`#` lines and blank lines are ignored. A value is everything after the first
+`=` — spaces, `#` and `=` are kept, quotes are **not** stripped and `$VAR` is
+**not** expanded. Invalid lines are reported with line numbers and change
+nothing; duplicate keys and the keys sshdev needs itself (`SSHDEV_*`,
+`XDG_*`, `NVIM_APPNAME`, `SSH_ASKPASS*`, `HOME`) are rejected.
+
+Saving applies the variables in two places:
+
+- **every ssh/scp command** sshdev runs for this workspace exports them at the
+  top of the remote script (so downloads, plugin installs and the server all
+  see them);
+- **the running remote server** gets them through the RPC control channel:
+  `vim.env` is updated, so LSPs, `:terminal` and `jobstart` children started
+  from now on inherit them. Already-running LSPs need a restart; values read
+  during nvim startup need a server restart (`:SshDevConnect!`).
+
+A server started later inherits the variables **before** your config loads, so
+config-time `vim.env` reads work on the next `:SshDevConnect`. With
+`env_on_connect` (default on) every `:SshDevConnect`/`:SshDevAttach` re-reads
+env.txt and injects it; removed lines unset the variable at runtime.
+
+**Inside the attached session**, `:SshDevEnv` opens the very same file on the
+server; a save applies immediately there and pushes the update back to the
+client through the control channel.
+
+The file may hold secrets: the local mirror and the remote copy are written
+with mode 0600, the buffer uses no swap/undo file, and values are never
+logged.
 
 ### Telescope
 
@@ -429,6 +476,8 @@ require('sshdev').setup({
 
   session = true,            -- save <workspace-profile>/session.vim on exit
   restore_session = true,    -- restore it when the server starts
+  forward_on_connect = true, -- re-apply forward.txt on (re)connect
+  env_on_connect = true,     -- re-inject env.txt on (re)connect
 
   ssh_bin = 'ssh', scp_bin = 'scp',
   ssh_args = { '-i', '~/.ssh/id_ed25519' },
@@ -464,6 +513,11 @@ Notes:
   profile for a new workspace.
 - History entries keep the **full destination including the ssh port**, so
   picking one reconnects to the right port.
+- `env.txt` values are injected into every ssh-run script and into the remote
+  server. Keys sshdev reserves (`SSHDEV_*`, `XDG_*`, `NVIM_APPNAME`,
+  `SSH_ASKPASS*`, `HOME`) are rejected; a saved variable reaches a running
+  LSP/terminal only after restarting it, and config-time reads need a server
+  restart (`:SshDevConnect!`).
 
 ## FAQ
 

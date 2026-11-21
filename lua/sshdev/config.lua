@@ -63,6 +63,11 @@ M.defaults = {
   ---already listen (leftovers from a previous session) are left alone.
   forward_on_connect = true,
 
+  ---Read the workspace's persisted env.txt on connect/attach and inject
+  ---its variables (startup exports + one runtime push after attach).
+  ---false = only an explicit :SshDevEnv save injects, for this nvim session.
+  env_on_connect = true,
+
   ---ssh/scp binaries.
   ssh_bin = 'ssh',
   scp_bin = 'scp',
@@ -269,6 +274,9 @@ function M.validate(cfg)
   end
   if type(cfg.forward_on_connect) ~= 'boolean' then
     return 'setup: "forward_on_connect" must be a boolean'
+  end
+  if type(cfg.env_on_connect) ~= 'boolean' then
+    return 'setup: "env_on_connect" must be a boolean'
   end
   if type(cfg.history) ~= 'boolean' then
     return 'setup: "history" must be a boolean'

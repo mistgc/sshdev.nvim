@@ -65,8 +65,23 @@ local function base_args(cfg, parsed, bin, flagstyle)
   return args
 end
 
+---Environment for a local ssh/scp child: the workspace's injected variables
+---merged with the askpass overlay (auth keys win). The lazy require keeps the
+---env <-> ssh module cycle out of load time.
+---@param cfg table
+---@param parsed table
+---@return table|nil
+local function proc_env(cfg, parsed)
+  local Env = require('sshdev.env')
+  return Util.merge_env(Env.spawn_overlay(parsed), Auth.env(cfg, parsed))
+end
+
 ---Run a POSIX sh script on the remote host. The script is fed on stdin of
 ---`sh -s`; parameters are embedded by the caller via Util.render().
+---
+---The workspace's injected environment is exported at the top of the
+---script, so the remote command sees those variables (the job's env only
+---affects the LOCAL ssh process).
 ---Returns the await() result: { code, stdout, stderr, timed_out }.
 ---@param cfg table
 ---@param parsed table
@@ -75,12 +90,16 @@ end
 ---@return table
 function M.run_script(cfg, parsed, script, opts)
   opts = opts or {}
+  local prefix = require('sshdev.env').script_prefix(parsed)
+  if prefix ~= '' then
+    script = prefix .. script
+  end
   local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
   vim.list_extend(args, { '--', parsed.dest, 'sh', '-s' })
   local res = Proc.await({
     cmd = args,
     input = script,
-    env = Auth.env(cfg, parsed),
+    env = proc_env(cfg, parsed),
     timeout = opts.timeout and opts.timeout * 1000 or nil,
     label = opts.label,
   })
@@ -96,6 +115,9 @@ end
 ---the SFTP protocol by default, where the remote path never goes through a
 ---remote shell, and literal quotes in it make Windows' scp fail with
 ---"realpath ...: No such file / path canonicalization failed".
+---
+---opts.preserve adds `-p` (keep the local file mode/mtime on the remote --
+---used for env.txt so a 0600 mirror stays 0600).
 ---Returns the await() result.
 ---@param cfg table
 ---@param parsed table
@@ -103,14 +125,19 @@ end
 ---@param filename string
 ---@param remote_path string
 ---@param timeout_s number|nil
+---@param opts table|nil { preserve = boolean }
 ---@return table
-function M.upload_file(cfg, parsed, cwd, filename, remote_path, timeout_s)
+function M.upload_file(cfg, parsed, cwd, filename, remote_path, timeout_s, opts)
+  opts = opts or {}
   local args = base_args(cfg, parsed, cfg.scp_bin, 'scp')
+  if opts.preserve then
+    vim.list_extend(args, { '-p' })
+  end
   vim.list_extend(args, { filename, parsed.dest .. ':' .. remote_path })
   local res = Proc.await({
     cmd = args,
     cwd = cwd,
-    env = Auth.env(cfg, parsed),
+    env = proc_env(cfg, parsed),
     timeout = timeout_s and timeout_s * 1000 or nil,
     label = 'scp',
   })
@@ -136,7 +163,7 @@ function M.upload_dir(cfg, parsed, cwd, dirname, remote_parent, timeout_s)
   local res = Proc.await({
     cmd = args,
     cwd = cwd,
-    env = Auth.env(cfg, parsed),
+    env = proc_env(cfg, parsed),
     timeout = timeout_s and timeout_s * 1000 or nil,
     label = 'scp',
   })
@@ -164,8 +191,9 @@ end
 ---@return table handle
 local function spawn_detached_tunnel(cfg, parsed, args, meta)
   -- password mode: the detached ssh process authenticates through askpass
-  -- (verified on Windows: detached, console-less children still run it)
-  local env = Auth.env(cfg, parsed)
+  -- (verified on Windows: detached, console-less children still run it);
+  -- the workspace's injected variables are merged underneath the auth keys
+  local env = proc_env(cfg, parsed)
   local t = vim.tbl_extend('keep', meta, {
     alive = false,
     stderr = {},

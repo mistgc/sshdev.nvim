@@ -14,6 +14,7 @@ local Scripts = require('sshdev.remote_scripts')
 local Bootstrap = require('sshdev.bootstrap')
 local Ssh = require('sshdev.ssh')
 local Forward = require('sshdev.forward')
+local Env = require('sshdev.env')
 local History = require('sshdev.history')
 local Picker = require('sshdev.picker')
 local Session = require('sshdev.session')
@@ -184,6 +185,24 @@ T.describe('util.tail', function()
   eq(Util.tail('a\nb\nc', 2), 'b\nc')
 end)
 
+T.describe('util.merge_env', function()
+  eq(Util.merge_env(nil, nil), nil)
+  eq(Util.merge_env({}, {}), nil, 'an empty result is nil (jobstart wants nil)')
+  eq(Util.merge_env({ A = '1' }, { A = '2', B = '3' }), { A = '2', B = '3' }, 'over wins')
+  eq(Util.merge_env({ A = '1' }, nil), { A = '1' })
+end)
+
+T.describe('util.extract_marked: token protocol', function()
+  local token = 'feedbeef'
+  local out = 'SSHDEV:FILE=yes\nSSHDEV:BEGIN-feedbeef\nA=1\n# note\nB=two words\nSSHDEV:END-feedbeef\n'
+  eq(Util.extract_marked(out, token), 'A=1\n# note\nB=two words')
+  eq(Util.extract_marked(out, 'deadbeef'), nil, 'a different token cannot confuse it')
+  eq(Util.extract_marked('SSHDEV:FILE=no\n', token), nil)
+  eq(Util.extract_marked(nil, token), nil)
+  local crlf = 'SSHDEV:BEGIN-x\nA=1\r\nSSHDEV:END-x\n'
+  eq(Util.extract_marked(crlf, 'x'), 'A=1', 'CRLF normalizes to LF')
+end)
+
 T.describe('util hash helpers', function()
   eq(Util.hash8('0123456789abcdef'), '01234567')
   eq(Util.hash8('ABC'), nil)
@@ -253,6 +272,7 @@ T.describe('config defaults (nvim profile + workspace profile)', function()
   eq(cfg.attach, 'auto')
   eq(cfg.session, true)
   eq(cfg.restore_session, true)
+  eq(cfg.env_on_connect, true)
   eq(cfg.history, true)
   eq(cfg.history_limit, 50)
   eq(cfg.workspace, nil)
@@ -303,6 +323,7 @@ T.describe('config validation: rejects', function()
     { { history_limit = 0 }, 'bad history_limit' },
     { { session = 'yes' }, 'session type' },
     { { forward_on_connect = 'yes' }, 'forward_on_connect type' },
+    { { env_on_connect = 'yes' }, 'env_on_connect type' },
   }
   for _, case in ipairs(bad) do
     local _, err = Config.setup(case[1])
@@ -319,6 +340,7 @@ T.describe('config.get falls back to defaults', function()
   eq(cfg.nvim_version, 'auto')
   eq(cfg.session, true)
   eq(cfg.forward_on_connect, true)
+  eq(cfg.env_on_connect, true)
   eq(cfg.workspace_profile, nil)
 end)
 
@@ -509,6 +531,7 @@ T.describe('layout: nvim profile / workspace profile paths', function()
   eq(l.session_file, l.workspace_profile .. '/session.vim')
   eq(l.helper_file, l.workspace_profile .. '/session.lua')
   eq(l.forward_file, l.workspace_profile .. '/forward.txt')
+  eq(l.env_file, l.workspace_profile .. '/env.txt')
   eq(l.last_used_file, l.workspace_profile .. '/last_used')
   eq(l.server_pid, l.workspace_profile .. '/server.pid')
 
@@ -633,6 +656,7 @@ local function render_all()
     SESSION = layout.session_file,
     RESTORE = '1',
     HELPER = layout.helper_file,
+    ENV_KEYS = 'DATABASE_URL NODE_ENV',
     FIND_RUNNING = Scripts.find_running,
     TOKEN = 'feedbeef',
   }
@@ -1193,6 +1217,334 @@ T.describe('forward: remote-side editor (the attached session)', function()
   _G.SSHDEV_CONTROL_CHANNEL = nil
   vim.env.SSHDEV_REMOTE = saved_remote
   vim.env.SSHDEV_WORKSPACE_PROFILE = saved_profile
+  Util.rmrf(dir)
+  if not okr then
+    error(err, 0)
+  end
+end)
+
+----------------------------------------------------------- environment
+
+T.describe('env.parse: strict KEY=VALUE', function()
+  -- values are VERBATIM: spaces, "=", "#", empty and surrounding spaces
+  local vars, errs = Env.parse(
+    '# comment\n'
+      .. '\n'
+      .. 'PATH=/usr/bin:/bin\n'
+      .. 'NODE_ENV=development\n'
+      .. 'EMPTY=\n'
+      .. 'WITH_EQUALS=a=b=c\n'
+      .. 'WITH_HASH=value # not a comment\n'
+      .. 'SPACED=  keep me  \r\n'
+  )
+  eq(errs, {})
+  eq(vars.PATH, '/usr/bin:/bin')
+  eq(vars.NODE_ENV, 'development')
+  eq(vars.EMPTY, '')
+  eq(vars.WITH_EQUALS, 'a=b=c')
+  eq(vars.WITH_HASH, 'value # not a comment')
+  eq(vars.SPACED, '  keep me  ', 'value preserved verbatim (only the CRLF \\r is stripped)')
+
+  -- every problem is reported with its line; a valid line still parses
+  local bad, bad_errs = Env.parse(
+    'export FOO=1\n'
+      .. '1BAD=x\n'
+      .. 'NO_EQUALS\n'
+      .. 'GOOD=1\n'
+      .. 'GOOD=2\n'
+      .. 'SSHDEV_REMOTE=0\n'
+      .. 'XDG_CONFIG_HOME=/x\n'
+      .. 'HOME=/x\n'
+      .. 'A B=c\n'
+  )
+  eq(#bad_errs, 8, 'all bad lines are reported')
+  eq(bad.GOOD, '1', 'the valid line still parses')
+  for i, ln in ipairs({ 1, 2, 3, 5, 6, 7, 8, 9 }) do
+    ok(bad_errs[i]:find(('line %d'):format(ln), 1, true) ~= nil, ('error cites line %d'):format(ln))
+  end
+  ok(bad_errs[1]:find('invalid variable name', 1, true) ~= nil, 'export is not special-cased')
+  ok(bad_errs[4]:find('line 4', 1, true) ~= nil, 'duplicate cites the first use')
+  ok(bad_errs[1]:find('export FOO', 1, true) ~= nil, 'the offending key is shown')
+
+  local _, nul_errs = Env.parse('NUL=a\0b\n')
+  eq(#nul_errs, 1, 'NUL in a value is rejected')
+  ok(nul_errs[1]:find('NUL', 1, true) ~= nil, 'the NUL error names the key')
+  local _, cr_errs = Env.parse('CR=a\rb\n')
+  eq(#cr_errs, 1, 'an internal carriage return is rejected')
+
+  -- a malformed line may be a secret: errors must never echo the raw line
+  local _, secret_errs = Env.parse('super-secret-token-with-no-equals\n')
+  eq(#secret_errs, 1)
+  ok(secret_errs[1]:find('super-secret', 1, true) == nil, 'the raw line is not echoed')
+
+  -- an editor BOM is not part of the first key
+  local bom_vars, bom_errs = Env.parse('\239\187\191FIRST=1\n')
+  eq(bom_errs, {})
+  eq(bom_vars.FIRST, '1')
+
+  -- a comment-only file (the fresh template) injects nothing
+  local none, nerr = Env.parse('# only comments\n\n# X=1\n')
+  eq(none, {})
+  eq(nerr, {})
+  local empty_vars, empty_errs = Env.parse('')
+  eq(empty_vars, {})
+  eq(empty_errs, {})
+end)
+
+T.describe('env: template and local_path', function()
+  -- the fresh-file template must parse to ZERO variables and ZERO errors
+  local tpl = Env.template('me@host:2222', '/home/me/src/app')
+  local vars, errs = Env.parse(tpl)
+  eq(vars, {})
+  eq(errs, {})
+  ok(tpl:find('# NODE_ENV=development', 1, true) ~= nil, 'example variable is commented out')
+  ok(tpl:find('me@host:2222', 1, true) ~= nil, 'template names the destination')
+  ok(tpl:find('/home/me/src/app', 1, true) ~= nil, 'template names the workspace')
+
+  -- the REMOTE side has no client destination string: omit that line
+  local rtl = Env.template(nil, '/home/me/app')
+  local rs, re_ = Env.parse(rtl)
+  eq(#rs, 0)
+  eq(#re_, 0)
+  ok(not rtl:find('destination:', 1, true), 'nil dest omits the destination line')
+  ok(rtl:find('# workspace:   /home/me/app', 1, true) ~= nil, 'workspace line kept')
+
+  -- the local mirror keeps the profile key recognizable and stays in cache
+  local p = vim.fs.normalize(Env.local_path('--laptop--home-me-src-app--'))
+  ok(p:find('/sshdev/env/%-%-laptop%-%-home%-me%-src%-app%-%-/env%.txt$') ~= nil,
+    'cache/sshdev/env/<workspace-profile-key>/env.txt')
+  ok(not pcall(Env.local_path, '../escape'), 'path separators in a key are rejected')
+  ok(not pcall(Env.local_path, ''), 'empty key is rejected')
+end)
+
+T.describe('env: active map, script_prefix and spawn_overlay', function()
+  local parsed = Util.parse_dest('me@host:2222')
+  Env.clear()
+  eq(Env.script_prefix(parsed), '', 'nothing active -> empty prefix')
+  eq(Env.spawn_overlay(parsed), nil)
+  eq(Env.status_line(), nil)
+
+  Env.set_active({ PATH = '/opt/bin:/usr/bin', QUOTED = "a'b $c & d", EMPTY = '' }, parsed)
+  local prefix = Env.script_prefix(parsed)
+  ok(prefix:find('export PATH=', 1, true) ~= nil, 'simple values are exported')
+  ok(prefix:find([[export QUOTED='a'\''b $c & d']], 1, true) ~= nil,
+    'single quotes are escaped for sh')
+  eq(Env.active_keys(parsed), 'EMPTY PATH QUOTED', 'manifest keys are sorted')
+  eq(Env.spawn_overlay(parsed).QUOTED, "a'b $c & d", 'the child env gets the raw value')
+  ok(Env.status_line():find('3 variable', 1, true) ~= nil, 'status counts the variables')
+
+  -- active is per destination (the port is part of the identity)
+  local other = Util.parse_dest('me@host')
+  eq(Env.active_for(other), nil, 'another destination sees nothing')
+  Env.set_active({}, parsed)
+  eq(Env.active_for(parsed), nil, 'an empty map is not active')
+  Env.clear()
+end)
+
+T.describe('env.script_prefix: values survive sh verbatim', function()
+  if vim.fn.executable('sh') ~= 1 then
+    print('  SKIP: no POSIX sh in PATH')
+    return
+  end
+  local parsed = Util.parse_dest('me@host')
+  local value = "a'b $HOME & c=d  end"
+  Env.set_active({ TRICKY = value, EMPTY = '' }, parsed)
+  local script = Env.script_prefix(parsed)
+    .. 'printf "%s\\n" "$TRICKY"\n'
+    .. 'printf "[%s]\\n" "$EMPTY"\n'
+  local res = vim.system({ 'sh', '-c', script }, { text = true }):wait()
+  eq(res.code, 0, 'the exported script runs: ' .. tostring(res.stderr))
+  eq(res.stdout, value .. '\n[]\n', 'quotes, $, &, = and spaces arrive verbatim')
+  Env.clear()
+end)
+
+T.describe('env: runtime chunk sets and unsets vim.env', function()
+  local saved_applied = _G.SSHDEV_ENV_APPLIED
+  local saved_keys = vim.env.SSHDEV_ENV_KEYS
+  local saved_a, saved_b, saved_c = vim.env.SSHDEV_OLD_A, vim.env.SSHDEV_OLD_B, vim.env.SSHDEV_NEW_V
+
+  _G.SSHDEV_ENV_APPLIED = nil
+  vim.env.SSHDEV_ENV_KEYS = 'SSHDEV_OLD_A SSHDEV_OLD_B'
+  vim.env.SSHDEV_OLD_A = 'a'
+  vim.env.SSHDEV_OLD_B = 'b'
+
+  Env.apply_runtime({ SSHDEV_OLD_B = 'kept', SSHDEV_NEW_V = 'v' })
+  eq(vim.env.SSHDEV_OLD_A, nil, 'a manifest key absent from the map is unset')
+  eq(vim.env.SSHDEV_OLD_B, 'kept', 'a kept key takes the new value')
+  eq(vim.env.SSHDEV_NEW_V, 'v', 'a new key is set')
+  eq(_G.SSHDEV_ENV_APPLIED.SSHDEV_NEW_V, 'v', 'the applied map is recorded')
+
+  Env.apply_runtime({})
+  eq(vim.env.SSHDEV_OLD_B, nil, 'an empty map unsets previously applied keys')
+  eq(vim.env.SSHDEV_NEW_V, nil)
+
+  _G.SSHDEV_ENV_APPLIED = saved_applied
+  vim.env.SSHDEV_ENV_KEYS = saved_keys
+  vim.env.SSHDEV_OLD_A = saved_a
+  vim.env.SSHDEV_OLD_B = saved_b
+  vim.env.SSHDEV_NEW_V = saved_c
+end)
+
+T.describe('remote scripts: env_fetch / env_prepare', function()
+  local rendered = render_all()
+  ok(rendered.env_fetch:find('[ -f "$ENV_FILE" ]', 1, true) ~= nil, 'fetch is read-only')
+  ok(rendered.env_fetch:find('SSHDEV:FILE=yes', 1, true) ~= nil, 'presence marker')
+  ok(rendered.env_fetch:find("TOKEN='feedbeef'", 1, true) ~= nil, 'the token travels in a variable')
+  ok(rendered.env_fetch:find('SSHDEV:BEGIN-%s', 1, true) ~= nil, 'begin marker uses the token')
+  ok(rendered.env_fetch:find('SSHDEV:END-%s', 1, true) ~= nil, 'end marker uses the token')
+  ok(rendered.env_fetch:find('tail -c 1', 1, true) ~= nil, 'a no-newline file cannot swallow the end marker')
+  ok(rendered.env_prepare:find('mkdir -p "$WS_PROFILE"', 1, true) ~= nil, 'prepare creates the profile dir')
+  ok(rendered.env_prepare:find('bad-workspace-path', 1, true) ~= nil, 'prepare guards the profile path')
+  ok(rendered.env_prepare:find('SSHDEV:ENV_DIR=ok', 1, true) ~= nil, 'prepare reports success')
+  ok(rendered.start:find("export SSHDEV_ENV_KEYS='DATABASE_URL NODE_ENV'", 1, true) ~= nil,
+    'the start script carries the injected-key manifest')
+end)
+
+T.describe('remote scripts: env_fetch executes against a fixture', function()
+  if vim.fn.executable('sh') ~= 1 then
+    print('  SKIP: no POSIX sh in PATH')
+    return
+  end
+  local fixture = 'tests/.tmp/env'
+  Util.rmrf(fixture)
+  local ws_dir = fixture .. '/workspace-profiles/--desk-1--home-me-app--'
+  Util.mkdir_p(ws_dir)
+  -- no trailing newline: the script must terminate the last line itself
+  write_file(ws_dir .. '/env.txt', 'A=1\n# note\nB=two words')
+
+  local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-env')
+  Util.rmrf(dir)
+  local function run(name, vars)
+    local f = vim.fs.abspath(vim.fs.joinpath(dir, name .. '.sh'))
+    write_file(f, Util.render(Scripts._templates[name], vars))
+    return vim.system({ 'sh', f }, { cwd = REPO_ROOT, text = true }):wait()
+  end
+
+  local env_vars = { WS_PROFILE = ws_dir, TOKEN = 'feedbeef' }
+  local res = run('env_fetch', env_vars)
+  eq(res.code, 0, 'env_fetch exits 0: ' .. tostring(res.stderr))
+  eq(Util.extract_marked(res.stdout, 'feedbeef'), 'A=1\n# note\nB=two words',
+    'exact content between the markers (final newline added)')
+
+  -- missing file: FILE=no, no markers
+  Util.rmrf(ws_dir)
+  local res2 = run('env_fetch', env_vars)
+  eq(res2.code, 0, 'env_fetch exits 0 without the file')
+  eq(Util.parse_keyvals(res2.stdout).FILE, 'no')
+  eq(Util.extract_marked(res2.stdout, 'feedbeef'), nil)
+
+  -- env_prepare mkdirs the guarded path
+  local prep_vars = {
+    ROOT = fixture .. '/root',
+    WS_PROFILE = fixture .. '/root/workspace-profiles/--desk-1--home-me-app--',
+  }
+  local res3 = run('env_prepare', prep_vars)
+  eq(res3.code, 0, 'env_prepare exits 0: ' .. tostring(res3.stderr))
+  ok(uv.fs_stat(prep_vars.WS_PROFILE) ~= nil, 'profile dir created')
+  local res4 = run('env_prepare', { ROOT = fixture .. '/root', WS_PROFILE = fixture .. '/elsewhere' })
+  ok(res4.code ~= 0, 'prepare refuses an unguarded path')
+  ok(tostring(res4.stdout):find('bad-workspace-path', 1, true) ~= nil, 'guard error marker')
+
+  Util.rmrf(fixture)
+  Util.rmrf(dir)
+end)
+
+T.describe('env: remote-side editor (the attached session)', function()
+  local function read_all(path)
+    local fd = assert(uv.fs_open(path, 'r', 438), 'cannot read ' .. tostring(path))
+    local st = uv.fs_fstat(fd)
+    local data = st.size > 0 and uv.fs_read(fd, st.size, 0) or ''
+    uv.fs_close(fd)
+    return data
+  end
+
+  local saved_remote = vim.env.SSHDEV_REMOTE
+  local saved_profile = vim.env.SSHDEV_WORKSPACE_PROFILE
+  local saved_foo = vim.env.FOO
+  local saved_applied = _G.SSHDEV_ENV_APPLIED
+  local orig_notify = vim.notify
+  local seen = nil
+  local function notify_spy()
+    seen = nil
+    vim.notify = function(msg, level)
+      seen = { msg = msg, level = level }
+    end
+  end
+
+  local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-env-remote')
+  local ws = vim.fs.joinpath(dir, 'workspace-profiles', '--h--home-me-app--')
+
+  local okr, err = pcall(function()
+    -- simulate running inside the remote server
+    vim.env.SSHDEV_REMOTE = '1'
+
+    -- 1. no control channel: actionable guidance, not a dead end
+    _G.SSHDEV_CONTROL_CHANNEL = nil
+    vim.env.SSHDEV_WORKSPACE_PROFILE = '/root/.sshdev.nvim/workspace-profiles/--h--w--'
+    notify_spy()
+    Session.env({})
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('client control channel is not available', 1, true) ~= nil,
+      'without a channel the guidance points at the client')
+    ok(seen and seen.msg:find(':detach', 1, true) ~= nil, 'the guidance names the workflow')
+
+    -- 2. with a channel id (dead on purpose): the editor opens REMOTELY
+    Util.rmrf(dir)
+    Util.mkdir_p(ws)
+    write_file(ws .. '/workspace.txt', '/home/me/app\n')
+    _G.SSHDEV_CONTROL_CHANNEL = 999999 -- no such channel: the push will fail
+    vim.env.SSHDEV_WORKSPACE_PROFILE = ws
+
+    notify_spy()
+    Session.env({})
+    vim.notify = orig_notify
+    local envf = vim.fs.joinpath(ws, 'env.txt')
+    ok(uv.fs_stat(envf) ~= nil, 'missing env.txt created with the template')
+    local content = read_all(envf)
+    ok(content:find('# workspace:   /home/me/app', 1, true) ~= nil, 'template names the workspace')
+    ok(not content:find('destination:', 1, true),
+      'no destination line (the client dest is unknown remotely)')
+    ok(seen and seen.msg:find('editing environment variables', 1, true) ~= nil,
+      'the open is announced')
+
+    -- the buffer is open; a save pushes through the (dead) channel
+    local buf
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b) == envf and vim.api.nvim_buf_is_loaded(b) then
+        buf = b
+        break
+      end
+    end
+    ok(buf ~= nil, 'the env.txt buffer is open in this session')
+    if buf then
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { 'FOO=bar' })
+      notify_spy()
+      local wok, werr = pcall(vim.cmd, 'write')
+      vim.notify = orig_notify
+      ok(seen and seen.msg:find('client could not be reached', 1, true) ~= nil,
+        'a dead control channel falls back to guidance on save')
+      ok(wok or tostring(werr):find('client could not be reached', 1, true) ~= nil,
+        'the fallback surfaces (headless may raise it through exec)')
+      eq(vim.env.FOO, 'bar', 'the remote save applies to the server itself')
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+
+    -- 3. a bogus profile is refused
+    notify_spy()
+    vim.env.SSHDEV_WORKSPACE_PROFILE = 'relative/path'
+    Session.env({})
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('no workspace profile', 1, true) ~= nil,
+      'a relative profile path is refused')
+  end)
+
+  -- unconditional cleanup, even after a failed assertion
+  _G.SSHDEV_CONTROL_CHANNEL = nil
+  _G.SSHDEV_ENV_APPLIED = saved_applied
+  vim.env.SSHDEV_REMOTE = saved_remote
+  vim.env.SSHDEV_WORKSPACE_PROFILE = saved_profile
+  vim.env.FOO = saved_foo
+  Env.clear()
   Util.rmrf(dir)
   if not okr then
     error(err, 0)

@@ -139,6 +139,35 @@ function M.tail(s, n)
   return table.concat(out, '\n')
 end
 
+---Extract the text between `SSHDEV:BEGIN-<token>` and `SSHDEV:END-<token>`
+---marker lines (a remote script's exact file content transfer).
+---
+---Transport realities: Proc.await drops EMPTY lines, so blank lines never
+---survive the transfer (semantically void to the line-based parsers that
+---use this); a content line ending in a bare \r is stripped (CRLF files
+---normalize to LF). A remote file without a trailing newline gains one --
+---harmless, :w writes one anyway.
+---@param stdout string|nil
+---@param token string the token rendered into the script
+---@return string? content  nil when the markers are absent
+function M.extract_marked(stdout, token)
+  local begin_marker = 'SSHDEV:BEGIN-' .. tostring(token)
+  local end_marker = 'SSHDEV:END-' .. tostring(token)
+  local lines = {}
+  local inside = false
+  for line in tostring(stdout or ''):gmatch('[^\r\n]+') do
+    if line == begin_marker then
+      inside = true
+      lines = {}
+    elseif line == end_marker then
+      return table.concat(lines, '\n')
+    elseif inside then
+      lines[#lines + 1] = line:gsub('\r$', '')
+    end
+  end
+  return nil
+end
+
 ---Parse "SSHDEV:KEY=VALUE" marker lines produced by remote scripts.
 ---@param text string|nil
 ---@return table
@@ -154,6 +183,32 @@ function M.parse_keyvals(text)
     end
   end
   return t
+end
+
+------------------------------------------------------------------------
+-- Process environment helpers
+------------------------------------------------------------------------
+
+---Shallow-merge two optional environment tables; `over` wins.
+---Returns nil when the result would be empty (jobstart wants nil, not {}).
+---@param base table|nil
+---@param over table|nil
+---@return table|nil
+function M.merge_env(base, over)
+  if not base and not over then
+    return nil
+  end
+  local out = {}
+  for k, v in pairs(base or {}) do
+    out[k] = v
+  end
+  for k, v in pairs(over or {}) do
+    out[k] = v
+  end
+  if next(out) == nil then
+    return nil
+  end
+  return out
 end
 
 ------------------------------------------------------------------------

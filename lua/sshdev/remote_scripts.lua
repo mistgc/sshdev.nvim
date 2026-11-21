@@ -447,6 +447,9 @@ export SSHDEV_NVIM_PROFILE="$NP"
 export SSHDEV_WORKSPACE_PROFILE="$WS_PROFILE"
 export SSHDEV_SESSION="$SESSION"
 export SSHDEV_RESTORE="$RESTORE"
+# key manifest of the injected environment: lets a later runtime push unset
+# variables removed from env.txt (values are exported by the client's prefix)
+export SSHDEV_ENV_KEYS='{{ENV_KEYS}}'
 
 nohup "$BIN" --headless --listen 127.0.0.1:"$RPORT" \
   -c "luafile $HELPER" </dev/null >"$LOG" 2>&1 &
@@ -704,6 +707,51 @@ mkdir -p "$WS_PROFILE"
 printf 'SSHDEV:FORWARD_DIR=ok\n'
 ]]
 
+---Read the workspace profile's env.txt (READ-ONLY) for :SshDevEnv.
+---
+---Reports `SSHDEV:FILE=yes|no`; on "yes" the EXACT file content is sent
+---between `SSHDEV:BEGIN-<TOKEN>` / `SSHDEV:END-<TOKEN>` markers.
+---Expects $WS_PROFILE and $TOKEN from the caller.
+M.env_fetch = [[
+set -eu
+WS_PROFILE='{{WS_PROFILE}}'
+TOKEN='{{TOKEN}}'
+ENV_FILE="$WS_PROFILE/env.txt"
+if [ -f "$ENV_FILE" ]; then
+  printf 'SSHDEV:FILE=yes\n'
+  printf 'SSHDEV:BEGIN-%s\n' "$TOKEN"
+  cat "$ENV_FILE"
+  # a file without a trailing newline must not swallow the END marker --
+  # and a file WITH one must not gain a blank line per round trip
+  if [ -n "$(tail -c 1 "$ENV_FILE" 2>/dev/null || true)" ]; then
+    printf '\n'
+  fi
+  printf 'SSHDEV:END-%s\n' "$TOKEN"
+else
+  printf 'SSHDEV:FILE=no\n'
+fi
+]]
+
+---Ensure the workspace profile directory exists before env.txt is scp'd
+---into it (:SshDevEnv on a workspace that was never connected).
+---Guards the path like Scripts.prepare does. Expects $ROOT and $WS_PROFILE.
+M.env_prepare = [[
+set -eu
+ROOT='{{ROOT}}'
+WS_PROFILE='{{WS_PROFILE}}'
+
+case "$WS_PROFILE" in
+  "$ROOT"/workspace-profiles/*) ;;
+  *) printf 'SSHDEV:ERROR=bad-workspace-path\n'; exit 1 ;;
+esac
+
+# env.txt may hold secrets: create/lock the profile directory down
+umask 077
+mkdir -p "$WS_PROFILE"
+chmod 700 "$WS_PROFILE" 2>/dev/null || true
+printf 'SSHDEV:ENV_DIR=ok\n'
+]]
+
 ---All templates by name, for rendering + tests.
 M._templates = {
   probe = M.probe,
@@ -717,6 +765,8 @@ M._templates = {
   list_nvim = M.list_nvim,
   forward_fetch = M.forward_fetch,
   forward_prepare = M.forward_prepare,
+  env_fetch = M.env_fetch,
+  env_prepare = M.env_prepare,
 }
 
 ---Shared fragments injected into several templates.

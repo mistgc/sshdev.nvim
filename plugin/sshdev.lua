@@ -277,6 +277,11 @@ end)
 ---profile and (re)starts the forwards (see |sshdev-forwards|).
 sshdev_cmd('SshDevForward', 'sshdev: edit the port forwards of a workspace (save to apply)', session_fn('forward'))
 
+---`:SshDevEnv [dest] [workspace]` — edit the workspace's environment.
+---Saving the opened env.txt buffer re-uploads it and injects the variables
+---into the remote server (see |sshdev-env|).
+sshdev_cmd('SshDevEnv', 'sshdev: edit the environment variables of a workspace (save to apply)', session_fn('env'))
+
 vim.api.nvim_create_user_command('SshDevLog', function()
   require('sshdev.util').open_log()
 end, { desc = 'sshdev: open the log' })

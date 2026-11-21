@@ -20,6 +20,7 @@
 --- TAB-separated `SSHDEV:WS=` / `SSHDEV:NP=` rows.
 
 local Auth = require('sshdev.auth')
+local Env = require('sshdev.env')
 local Layout = require('sshdev.layout')
 local Scripts = require('sshdev.remote_scripts')
 local Ssh = require('sshdev.ssh')
@@ -425,6 +426,7 @@ function M.start_server(cfg, parsed, layout, rport, restore)
     SESSION = Util.shsafe(cfg.session and session_file or '', 'session file'),
     RESTORE = (cfg.session and restore ~= false) and '1' or '0',
     HELPER = Util.shsafe(layout.helper_file, 'session helper'),
+    ENV_KEYS = Util.shsafe(Env.active_keys(parsed), 'environment keys'),
   })
   local res = Ssh.run_script(cfg, parsed, script, {
     timeout = cfg.timeouts.ssh,

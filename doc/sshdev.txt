@@ -138,6 +138,28 @@ COMMANDS						*sshdev-commands*
 	client-side over an RPC control channel (see |sshdev-forwards-attached|).
 	See |sshdev-forwards|.
 
+*:SshDevEnv*
+:SshDevEnv [{dest}] [{workspace}]
+	Edit the environment variables of a workspace: opens its
+	`<workspace-profile>/env.txt` (fetched into a local buffer; an
+	all-commented template is created when the file does not exist
+	yet). Strict format, one variable per line: >
+	    KEY=VALUE
+	    DATABASE_URL=postgres://127.0.0.1:5432/app
+<	The value is everything after the first "=", used verbatim (no
+	quote stripping, no $VAR expansion). "#"-lines and blank lines are
+	ignored. SAVING the buffer re-uploads the file and injects the
+	variables: every ssh-run script exports them, and a running server
+	gets them through the RPC control channel (vim.env). Invalid lines
+	are reported with their line numbers and change nothing; duplicate
+	keys and the keys sshdev reserves (SSHDEV_*, XDG_*, NVIM_APPNAME,
+	SSH_ASKPASS*, HOME) are rejected. Without arguments the ACTIVE
+	session's workspace profile is used; [dest] [workspace] resolve it
+	like :SshDevConnect. Inside the ATTACHED remote session the command
+	opens the same file in the attached UI; a save applies on the server
+	and refreshes the client over the control channel (see
+	|sshdev-env-attached|). See |sshdev-env|.
+
 *:SshDevLog*
 :SshDevLog			Open the sshdev log buffer.
 
@@ -306,6 +328,67 @@ the pid), or until :SshDevAttach reuses the session.
 Local listeners bind loopback only -- nothing is exposed to the network.
 
 ==============================================================================
+ENVIRONMENT VARIABLES					*sshdev-env*
+
+`:SshDevEnv` manages custom environment variables for a workspace. Like
+forward.txt, the list is per-(client, workspace) state, so it lives in the
+REMOTE workspace profile: >
+
+	<remote_root>/workspace-profiles/--<host>--<ws-path>--/env.txt
+
+Format -- one variable per line, values verbatim: >
+
+	KEY=VALUE
+	NODE_ENV=development
+	DATABASE_URL=postgres://127.0.0.1:5432/app
+	PATH=/opt/tools/bin:/usr/bin:/bin
+<
+`#`-lines and blank lines are ignored. A value is everything after the
+FIRST "="; spaces, "#" and "=" are kept, quotes are not stripped and
+$VAR is not expanded. An empty value is allowed. Duplicate keys and the
+keys sshdev needs itself are rejected: `SSHDEV_*`, `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `NVIM_APPNAME`,
+`SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `HOME` (the last one would point a
+local ssh child at the wrong config/keys). Invalid lines are reported
+with their line numbers; a single bad line means nothing is applied.
+
+Injection points:
+
+	* every remote script sshdev runs is prefixed with
+	  `export KEY='value'` lines, so the nvim download, the headless
+	  plugin install and the server start all see the variables;
+	* the server process inherits them BEFORE your config loads, so
+	  `vim.env` reads at startup work;
+	* a RUNNING server receives them through the RPC control channel
+	  (`vim.env` is updated), so LSPs/terminals/jobs started later
+	  inherit them. A process already started (an LSP client) keeps
+	  its old environment -- restart it; config-time reads need a
+	  server restart (:SshDevConnect!);
+	* ssh/scp child processes also get the variables in their local
+	  environment (auth keys win). This does NOT forward them to the
+	  remote command -- the script prefix above is what the remote
+	  side sees.
+
+Saving env.txt uploads it to the workspace profile (mode 0600) and
+applies it. With `env_on_connect` (default on) every
+:SshDevConnect/:SshDevAttach re-reads the file and injects it; removed
+lines unset the variable at runtime (a server started before this
+feature has no key manifest and needs a restart instead).
+
+The local mirror and the remote file are 0600, the buffer uses no
+swap/undo file, and values never appear in the log or notifications.
+
+INSIDE THE ATTACHED SESSION					*sshdev-env-attached*
+
+With the default "connect" attach, :SshDevEnv typed in the attached
+session opens the env.txt on the SERVER. A save is applied to that
+server immediately, then the client is notified over
+`SSHDEV_CONTROL_CHANNEL` to refresh its local mirror and active map
+(which later ssh/scp commands use). When the control channel is
+unavailable the file still applies to the server; the client mirror
+refreshes on the next :SshDevConnect.
+
+==============================================================================
 PASSWORD AUTHENTICATION					*sshdev-auth*
 
 `auth = "auto"` (the default) tries key/ssh-agent first, fully
@@ -382,7 +465,7 @@ REMOTE LAYOUT						*sshdev-layout*
         ├── nvim-profile -> ../../nvim-profiles/<key>/  (relative symlink)
         ├── nvim-profile.txt  workspace.txt  client-host
         ├── session.lua                           session helper
-        ├── session.vim  forward.txt  last_used
+        ├── session.vim  forward.txt  env.txt  last_used
         └── server.pid  server.addr  server.log
 
 The server runs with `NVIM_APPNAME=nvim-config` and the XDG dirs pointing into
@@ -428,6 +511,7 @@ Setup with defaults (all keys optional): >
 	  session = true,              -- save <workspace-profile>/session.vim
 	  restore_session = true,      -- restore it on start
 	  forward_on_connect = true,    -- re-apply forward.txt on (re)connect
+	  env_on_connect = true,        -- re-inject env.txt on (re)connect
 	  ssh_bin = 'ssh', scp_bin = 'scp',
 	  ssh_args = { '-i', '~/.ssh/id_ed25519' },
 	  auth = 'auto',       -- "auto" (key first, password fallback) | "password" | "key"
@@ -490,6 +574,15 @@ forward_on_connect ~
 	all already listen (leftovers from a previous session) are assumed
 	running and kept. Set false to manage forwards purely manually.
 	See |sshdev-forwards|.
+
+env_on_connect ~
+	Default true: after every :SshDevConnect / :SshDevAttach the
+	workspace's persisted env.txt is re-read (one extra read-only ssh
+	round trip) and its variables are injected: the start script
+	exports them before your config loads, and an already-running
+	server gets them over the control channel. Silently does nothing
+	without an env.txt. Set false to only inject what an explicit
+	:SshDevEnv save loaded for this nvim session. See |sshdev-env|.
 
 attach ~
 	See |sshdev-attach|.
@@ -557,6 +650,15 @@ the remote server log is `<workspace-profile>/server.log`.
   is reported and the previous forwards are restored.
 - forward.txt parse errors -- the save reported the exact lines; nothing
   was uploaded or applied until they are fixed.
+- A new variable does not reach a running LSP/terminal -- a process keeps
+  the environment it was started with; restart the LSP client / open a new
+  terminal. Config-time `vim.env` reads need a server restart
+  (:SshDevConnect!). See |sshdev-env|.
+- env.txt parse errors -- the save reported the exact lines; nothing was
+  uploaded or applied until they are fixed (values are never echoed).
+- A removed variable still exists after saving -- the running server was
+  started before sshdev exported the key manifest; :SshDevConnect!
+  restarts it with the current env.txt.
 - Old layout after upgrading -- see |sshdev-layout| (binaries and saved
   sessions are migrated; plugins are reinstalled once).
 
