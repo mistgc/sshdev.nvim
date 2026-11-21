@@ -22,6 +22,7 @@ local M = {}
 
 local Auth = require('sshdev.auth')
 local Proc = require('sshdev.proc')
+local Scripts = require('sshdev.remote_scripts')
 local Util = require('sshdev.util')
 
 ---libuv handle (vim.uv in >= 0.10, vim.loop as legacy alias).
@@ -145,6 +146,30 @@ function M.upload_file(cfg, parsed, cwd, filename, remote_path, timeout_s, opts)
     Auth.forget(parsed)
   end
   return res
+end
+
+---Force a remote file's mode (e.g. env.txt 0600 after an upload).
+---
+---An upload cannot be trusted to deliver a restrictive mode: `scp -p` copies
+---the local stat() mode, and on Windows that is 0666 even when libuv created
+---the file with mode 0600 -- a secret-bearing file would silently become
+---world-readable on the remote. The mode is therefore asserted with an
+---explicit `chmod` over the same ssh path the other remote scripts use.
+---@param cfg table
+---@param parsed table
+---@param remote_path string absolute remote file
+---@param mode string digit mode, e.g. "600"
+---@param timeout_s number|nil
+---@return table res await() result; success reports `SSHDEV:CHMOD=ok`
+function M.chmod_remote(cfg, parsed, remote_path, mode, timeout_s)
+  local script = Util.render(Scripts.env_chmod, {
+    PATH = Util.shsafe(remote_path, 'remote file'),
+    MODE = Util.shsafe(tostring(mode), 'remote file mode'),
+  })
+  return M.run_script(cfg, parsed, script, {
+    timeout = timeout_s,
+    label = 'chmod',
+  })
 end
 
 ---scp one local directory (relative to `cwd`) INTO `remote_parent`

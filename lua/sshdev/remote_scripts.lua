@@ -752,6 +752,37 @@ chmod 700 "$WS_PROFILE" 2>/dev/null || true
 printf 'SSHDEV:ENV_DIR=ok\n'
 ]]
 
+---Force the mode of an uploaded workspace-profile file (env.txt).
+---
+---scp does NOT carry the intended 0600 across platforms: the local mirror is
+---created 0600 through libuv, but on Windows libuv/stat reports 0666 and
+---`scp -p` copies that verbatim onto the remote file (the previous, safe mode
+---of an existing file is not preserved). env.txt may hold secrets, so the
+---mode is asserted explicitly on the remote after the upload instead of
+---trusting the client platform's stat()/scp behavior.
+---
+---Expects $PATH (absolute remote file) and $MODE (a digit mode, e.g. 0600)
+---from the caller. A missing target or a bad mode is an error, not a silent
+---no-op, so the caller can report it.
+M.env_chmod = [[
+set -eu
+P='{{PATH}}'
+MODE='{{MODE}}'
+
+case "$MODE" in
+  [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+  *) printf 'SSHDEV:ERROR=bad-mode\n'; exit 1 ;;
+esac
+
+if [ ! -f "$P" ]; then
+  printf 'SSHDEV:ERROR=no-file\n'
+  exit 1
+fi
+
+chmod "$MODE" "$P"
+printf 'SSHDEV:CHMOD=ok\n'
+]]
+
 ---All templates by name, for rendering + tests.
 M._templates = {
   probe = M.probe,
@@ -767,6 +798,7 @@ M._templates = {
   forward_prepare = M.forward_prepare,
   env_fetch = M.env_fetch,
   env_prepare = M.env_prepare,
+  env_chmod = M.env_chmod,
 }
 
 ---Shared fragments injected into several templates.

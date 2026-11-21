@@ -140,9 +140,12 @@ saved with `:SshDevEnv` in this nvim session are injected.
    `stdpath("cache")/sshdev/env/<ws-key>/env.txt`, and opens it.
 2. `BufWritePost` triggers `Env.apply`:
    parse the mirror → on errors notify and change nothing →
-   `Scripts.env_prepare` if the remote file is new → `Ssh.upload_file` with
-   `-p` (keeps the 0600 mode) → update the active map → `Env.push` when a
-   control channel exists.
+   `Scripts.env_prepare` if the remote file is new → `Ssh.upload_file` (no
+   `-p`: the mode is asserted separately) → `Scripts.env_chmod` forces the
+   remote copy to **0600** (an explicit remote `chmod`; `scp -p` would copy
+   the client's mode, and a Windows client reports 0666) → update the active
+   map → `Env.push` when a control channel exists. A failed chmod is reported
+   in the save notification instead of silently leaving a wider mode.
 3. Without a running server the file is only persisted; the next
    `:SshDevConnect` starts the server with it.
 
@@ -203,8 +206,12 @@ mirror and ssh/scp environment refresh on the next connect.
 - Values may be secrets. They are never logged or shown in notifications;
   errors cite line numbers and keys only.
 - A failed `env_fetch` reports the ssh stderr tail, never the captured stdout.
-- Local mirror 0600, remote `env.txt` 0600 (`scp -p`), `env_prepare` uses
-  `umask 077` and best-effort `chmod 700` on the profile directory.
+- Local mirror 0600; the remote `env.txt` mode is **forced to 0600 after every
+  upload** with an explicit remote `chmod` (`Scripts.env_chmod`) — an upload
+  alone cannot be trusted for it, because `scp -p` copies the client's
+  stat mode and a Windows client reports 0666. The remote-side editor also
+  re-asserts 0600 on every save. `env_prepare` uses `umask 077` and
+  best-effort `chmod 700` on the profile directory.
 - No swap/undo file for the `env.txt` buffer.
 - The local ssh/scp child environment contains the values (the user asked for
   injection into ssh commands). This is visible to the same user's processes,
@@ -242,9 +249,9 @@ config upload or plugin reinstall.
 
 | Module | Responsibility |
 | --- | --- |
-| `lua/sshdev/env.lua` | parse/template/local mirror, active map, open/apply/apply_remote/open_remote, runtime chunk |
-| `lua/sshdev/ssh.lua` | script prefix, local ssh/scp env overlay, `scp -p` |
-| `lua/sshdev/remote_scripts.lua` | `env_fetch`, `env_prepare`, `start` key manifest |
+| `lua/sshdev/env.lua` | parse/template/local mirror, active map, open/apply/apply_remote/open_remote, runtime chunk, remote-mode assertion |
+| `lua/sshdev/ssh.lua` | script prefix, local ssh/scp env overlay, remote `chmod` |
+| `lua/sshdev/remote_scripts.lua` | `env_fetch`, `env_prepare`, `env_chmod`, `start` key manifest |
 | `lua/sshdev/bootstrap.lua` | renders `ENV_KEYS` into the start script |
 | `lua/sshdev/session.lua` | `load_env`, `:SshDevEnv` flow, remote-triggered apply, attach-time push |
 | `lua/sshdev/layout.lua` | `<workspace-profile>/env.txt` path |

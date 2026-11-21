@@ -657,6 +657,8 @@ local function render_all()
     RESTORE = '1',
     HELPER = layout.helper_file,
     ENV_KEYS = 'DATABASE_URL NODE_ENV',
+    PATH = layout.env_file,
+    MODE = '600',
     FIND_RUNNING = Scripts.find_running,
     TOKEN = 'feedbeef',
   }
@@ -1396,6 +1398,10 @@ T.describe('remote scripts: env_fetch / env_prepare', function()
   ok(rendered.env_prepare:find('mkdir -p "$WS_PROFILE"', 1, true) ~= nil, 'prepare creates the profile dir')
   ok(rendered.env_prepare:find('bad-workspace-path', 1, true) ~= nil, 'prepare guards the profile path')
   ok(rendered.env_prepare:find('SSHDEV:ENV_DIR=ok', 1, true) ~= nil, 'prepare reports success')
+  ok(rendered.env_chmod:find("MODE='600'", 1, true) ~= nil, 'chmod template carries the asserted mode')
+  ok(rendered.env_chmod:find('SSHDEV:ERROR=bad-mode', 1, true) ~= nil, 'chmod validates the mode')
+  ok(rendered.env_chmod:find('SSHDEV:ERROR=no-file', 1, true) ~= nil, 'chmod requires the target file')
+  ok(rendered.env_chmod:find('SSHDEV:CHMOD=ok', 1, true) ~= nil, 'chmod reports success')
   ok(rendered.start:find("export SSHDEV_ENV_KEYS='DATABASE_URL NODE_ENV'", 1, true) ~= nil,
     'the start script carries the injected-key manifest')
 end)
@@ -1445,8 +1451,99 @@ T.describe('remote scripts: env_fetch executes against a fixture', function()
   ok(res4.code ~= 0, 'prepare refuses an unguarded path')
   ok(tostring(res4.stdout):find('bad-workspace-path', 1, true) ~= nil, 'guard error marker')
 
+  -- env_chmod forces the mode (scp -p copies the Windows 0666 mirror mode):
+  -- an existing world-readable file must become 0600 again
+  local target = prep_vars.WS_PROFILE .. '/env.txt'
+  write_file(target, 'A=1\n')
+  uv.fs_chmod(target, 438) -- 0666
+  eq(uv.fs_stat(target).mode % 512, 438, 'fixture starts world-readable')
+  local res5 = run('env_chmod', { PATH = target, MODE = '600' })
+  eq(res5.code, 0, 'env_chmod exits 0: ' .. tostring(res5.stderr))
+  ok(tostring(res5.stdout):find('SSHDEV:CHMOD=ok', 1, true) ~= nil, 'chmod success marker')
+  if vim.fn.has('win32') == 0 then
+    eq(uv.fs_stat(target).mode % 512, 384, 'the file is 0600 after the chmod')
+  else
+    -- NTFS has no POSIX mode bits; a MSYS/Git-Bash chmod is a no-op emulation
+    print('  SKIP: POSIX permission bits are not meaningful on Windows')
+  end
+  -- bad mode / missing file are explicit errors (never a silent success)
+  local res6 = run('env_chmod', { PATH = target, MODE = '999' })
+  ok(res6.code ~= 0, 'a non-octal mode is rejected')
+  ok(tostring(res6.stdout):find('bad-mode', 1, true) ~= nil, 'bad-mode marker')
+  local res7 = run('env_chmod', { PATH = fixture .. '/missing.txt', MODE = '600' })
+  ok(res7.code ~= 0, 'a missing target is rejected')
+  ok(tostring(res7.stdout):find('no-file', 1, true) ~= nil, 'no-file marker')
+
   Util.rmrf(fixture)
   Util.rmrf(dir)
+end)
+
+T.describe('env: apply forces 0600 on the remote env.txt', function()
+  -- scp cannot carry the 0600 intent on every platform (Windows reports 0666
+  -- and `scp -p` copies it), so Env.apply must assert the mode explicitly.
+  local cfg = Config.get()
+  local parsed = Util.parse_dest('me@host:2222')
+  local ws_key = '--desk-1--home-me-src-app--'
+  local mirror = Env.local_path(ws_key)
+  Util.mkdir_p(vim.fs.dirname(mirror))
+  write_file(mirror, 'NODE_ENV=development\n')
+
+  local orig_upload, orig_chmod, orig_notify = Ssh.upload_file, Ssh.chmod_remote, vim.notify
+  local chmods, notified = {}, {}
+  local function apply_once()
+    notified = {}
+    return Env.apply({
+      cfg = cfg,
+      parsed = parsed,
+      remote_root = '~/.sshdev.nvim',
+      workspace = '/home/me/src/app',
+      workspace_profile = '~/.sshdev.nvim/workspace-profiles/' .. ws_key,
+      workspace_profile_key = ws_key,
+      remote_missing = false,
+    })
+  end
+
+  local okr, err = pcall(function()
+    Ssh.upload_file = function()
+      return { code = 0, stdout = '', stderr = '' }
+    end
+    Ssh.chmod_remote = function(_, _, remote_path, mode)
+      chmods[#chmods + 1] = { path = remote_path, mode = mode }
+      return { code = 0, stdout = 'SSHDEV:CHMOD=ok\n', stderr = '' }
+    end
+    vim.notify = function(msg)
+      notified[#notified + 1] = msg
+    end
+
+    apply_once()
+    eq(#chmods, 1, 'the remote env.txt is chmodded after the upload')
+    eq(chmods[1].mode, '600', 'the asserted mode is 0600')
+    eq(
+      chmods[1].path,
+      '~/.sshdev.nvim/workspace-profiles/' .. ws_key .. '/env.txt',
+      'the remote env.txt path is chmodded'
+    )
+    ok(not tostring(notified[#notified]):find('WARNING', 1, true), 'no warning when the chmod works')
+    ok(tostring(notified[#notified]):find('env saved', 1, true) ~= nil, 'the save is reported')
+
+    -- a failed chmod must be surfaced: the file may hold secrets
+    chmods = {}
+    Ssh.chmod_remote = function()
+      return { code = 1, stdout = 'SSHDEV:ERROR=no-file\n', stderr = 'chmod: missing target' }
+    end
+    apply_once()
+    ok(tostring(notified[#notified]):find('WARNING', 1, true) ~= nil, 'a failed chmod is warned about')
+    ok(tostring(notified[#notified]):find('0600', 1, true) ~= nil, 'the warning names the mode')
+  end)
+
+  Ssh.upload_file = orig_upload
+  Ssh.chmod_remote = orig_chmod
+  vim.notify = orig_notify
+  Env.clear()
+  Util.rmrf(vim.fs.dirname(mirror))
+  if not okr then
+    error(err)
+  end
 end)
 
 T.describe('env: remote-side editor (the attached session)', function()
@@ -1518,6 +1615,9 @@ T.describe('env: remote-side editor (the attached session)', function()
     ok(buf ~= nil, 'the env.txt buffer is open in this session')
     if buf then
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, { 'FOO=bar' })
+      if vim.fn.has('win32') == 0 then
+        uv.fs_chmod(envf, 438) -- 0666: a widened mode the save must heal
+      end
       notify_spy()
       local wok, werr = pcall(vim.cmd, 'write')
       vim.notify = orig_notify
@@ -1526,6 +1626,9 @@ T.describe('env: remote-side editor (the attached session)', function()
       ok(wok or tostring(werr):find('client could not be reached', 1, true) ~= nil,
         'the fallback surfaces (headless may raise it through exec)')
       eq(vim.env.FOO, 'bar', 'the remote save applies to the server itself')
+      if vim.fn.has('win32') == 0 then
+        eq(uv.fs_stat(envf).mode % 512, 384, 'a remote-side save re-asserts env.txt 0600')
+      end
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
 

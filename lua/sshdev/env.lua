@@ -656,8 +656,7 @@ function M.apply(ctx)
     vim.fs.dirname(path),
     'env.txt',
     remote_file,
-    ctx.cfg.timeouts.ssh,
-    { preserve = true } -- keep the 0600 mirror mode on the remote
+    ctx.cfg.timeouts.ssh
   )
   if up.code ~= 0 then
     return fail(('uploading env.txt to %s failed (exit %s):\n%s%s'):format(
@@ -668,6 +667,20 @@ function M.apply(ctx)
     ))
   end
   Util.log('env.txt uploaded to %s', remote_file)
+
+  -- Force the remote mode: the upload must not decide it. On Windows the
+  -- local mirror reports 0666 (libuv/stat has no POSIX modes) and `scp -p`
+  -- copies that onto a file that may hold secrets, so env.txt is chmod 0600
+  -- explicitly. A failed chmod does not undo the (already uploaded) content:
+  -- the variables are still applied and the problem is reported.
+  local perm = Ssh.chmod_remote(ctx.cfg, ctx.parsed, remote_file, '600', ctx.cfg.timeouts.ssh)
+  local perm_ok = perm.code == 0 and perm.stdout:find('SSHDEV:CHMOD=ok', 1, true) ~= nil
+  local perm_note = ''
+  if not perm_ok then
+    local tail = Util.tail(perm.stderr .. perm.stdout, 5)
+    Util.log('env: could not chmod 0600 %s: %s', remote_file, tail)
+    perm_note = ('\nWARNING: could not set mode 0600 on the remote env.txt:\n%s'):format(tail)
+  end
 
   M.set_active(vars, ctx.parsed)
   local n = vim.tbl_count(vars)
@@ -680,16 +693,18 @@ function M.apply(ctx)
         msg = ('env saved (%d variable(s)) — applied to the running server; '
           .. 'restart LSPs/terminals to pick them up'):format(n)
       end
-      return Util.notify(msg)
+      return Util.notify(msg .. perm_note)
     end
     return Util.notify(
       ('env saved (%d variable(s)) — uploaded, but the running server could not '
-        .. 'be reached; it applies on the next :SshDevConnect/start'):format(n)
+        .. 'be reached; it applies on the next :SshDevConnect/start'):format(n) .. perm_note
     )
   end
   Util.notify(
-    n == 0 and 'env.txt saved: no variables (they take effect when the server restarts)'
-      or ('env saved (%d variable(s)) — takes effect on the next :SshDevConnect/start'):format(n)
+    (
+      n == 0 and 'env.txt saved: no variables (they take effect when the server restarts)'
+        or ('env saved (%d variable(s)) — takes effect on the next :SshDevConnect/start'):format(n)
+    ) .. perm_note
   )
 end
 
@@ -835,6 +850,10 @@ function M.open_remote(profile)
         return Util.notify(('cannot read %s: %s'):format(path, tostring(rerr)),
           vim.log.levels.ERROR)
       end
+      -- env.txt may hold secrets: assert the restrictive mode on every save
+      -- (heals a mode widened by a backup/rename write, an older client or a
+      -- pre-fix scp upload); no client round trip is needed for it.
+      uv.fs_chmod(path, 384) -- 0600
       local vars, errs = M.parse(content)
       if #errs > 0 then
         return Util.notify(

@@ -369,8 +369,10 @@ Injection points:
 	  remote command -- the script prefix above is what the remote
 	  side sees.
 
-Saving env.txt uploads it to the workspace profile (mode 0600) and
-applies it. With `env_on_connect` (default on) every
+Saving env.txt uploads it to the workspace profile and applies it. The
+remote copy is forced to mode 0600 after every upload (an explicit
+remote chmod: scp alone would copy the client's mode, which is 0666 on
+Windows). With `env_on_connect` (default on) every
 :SshDevConnect/:SshDevAttach re-reads the file and injects it; removed
 lines unset the variable at runtime (a server started before this
 feature has no key manifest and needs a restart instead).
