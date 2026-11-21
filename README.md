@@ -40,8 +40,9 @@ The state on the remote host is split into two independent levels:
   <remote_root>/workspace-profiles/--<local-hostname>--<workspace-path>--/
   ```
 
-  It holds `session.vim`, the server pid/address/log and a relative symlink to
-  the nvim profile (`nvim-profile -> ../../nvim-profiles/<nvim-profile-key>`).
+  It holds `session.vim`, the optional workspace files `forward.txt` and
+  `env.txt`, the server pid/address/log and a relative symlink to the nvim
+  profile (`nvim-profile -> ../../nvim-profiles/<nvim-profile-key>`).
 
 ## What it does
 
@@ -61,6 +62,9 @@ The state on the remote host is split into two independent levels:
    `<workspace-profile>/session.vim` when it exits, so the next connection
    brings back the same buffers, windows and layout. `:q` behaves normally —
    there is no quit hijacking.
+6. **Forwards workspace services** (`:SshDevForward`) and **injects workspace
+   environment variables** (`:SshDevEnv`): both files live in the remote
+   workspace profile, are edited locally, and are re-applied on reconnect.
 
 MIT licensed.
 
@@ -120,8 +124,8 @@ With telescope (optional — enables the fuzzy pickers):
 :SshDevSync                          " re-upload config + reinstall plugins
 :SshDevStop                          " stop the server (saves session) + tunnel
 :SshDevStatus                        " session / profiles / tunnel / server report
-:SshDevForward                       " edit this workspace's port forwards
-:SshDevEnv                           " edit this workspace's environment variables
+:SshDevForward [dest] [workspace]    " edit port forwards (save = apply)
+:SshDevEnv [dest] [workspace]        " edit env variables (save = apply)
 :SshDevHistory [dest]                " remote workspace picker (client-host scoped)
 :SshDevProfiles [dest]               " list reusable nvim profiles on the remote
 :SshDevLog                           " open the log
@@ -182,52 +186,131 @@ entry.
 
 ### Port forwards (`:SshDevForward`)
 
-The workspace's forwards live in its remote workspace profile —
-`<workspace-profile>/forward.txt` — and are edited through a local mirror:
+A workspace can declare extra SSH forwards so that services reachable only
+from the **server** appear on your **local** `127.0.0.1`. The declaration is
+a per-workspace file in the remote workspace profile —
+`<workspace-profile>/forward.txt` — and is edited through a local mirror:
 
 ```vim
-:SshDevForward                       " open (or create) forward.txt for edit
+:SshDevForward                       " active session's workspace (fastest, no probe)
+:SshDevForward me@myhost             " that destination; workspace from setup()
+:SshDevForward me@myhost ~/src/app   " fully explicit, no active session needed
 ```
+
+```lua
+require('sshdev').forward({ dest = 'me@myhost', workspace = '~/src/app' })
+```
+
+`[dest]` and `[workspace]` resolve like the connect commands, including named
+`remotes` entries. Without an active session, the missing pieces come from
+`setup({ host = ..., workspace = ... })` or from the arguments;
+`--auth=password` is accepted, and `--nvim-profile` is accepted but irrelevant
+(forward.txt belongs to the workspace profile, not the nvim profile). If the
+file does not exist yet, an all-commented template is created — uncomment the
+lines you need and save the buffer:
 
 ```text
 # one forward per line: <local-port> = <remote-host>:<remote-port>
+# (127.0.0.1 means the server's own loopback; other hosts are resolved there)
 3080 = 127.0.0.1:3080
 8080 = 127.0.0.1:8080
+5432 = db.internal:5432
 ```
 
-Saving the buffer re-uploads the file to the workspace profile and replaces
-the running forwards with **one** detached `ssh -N` carrying a `-L` per
-line: this client's `127.0.0.1:3080/8080` reach the **server's**
-`127.0.0.1:3080/8080`. The target is resolved on the server, so
-`5432 = db.internal:5432` reaches hosts only the server can see. `#` lines
-and blank lines are ignored; an empty file stops all forwards; invalid
-lines are reported with line numbers and change nothing. The new tunnel is
-only reported as applied once it verifiably accepts connections — a failed
-start (busy port, auth) reports ssh's own error and **restores the previous
-forward set**. The forward tunnel is stopped by `:SshDevStop` and when the
-local nvim exits — reopen `:SshDevForward` and save to re-establish.
+Inline `#` comments after a forward are **not** supported — put comments on
+their own line.
+
+- The **local port** is bound on this machine's `127.0.0.1` (loopback only,
+  never exposed to the network).
+- The **target** is resolved on the server: `127.0.0.1:3080` means the
+  server's own loopback, and `db.internal:5432` is reached from the server's
+  network — the right way to bring remote-only internal services to your desk.
+- `#` lines and blank lines are ignored; whitespace and CRLF files are
+  tolerated; an **empty file stops all forwards**.
+- IPv6 target literals are not supported (the same limitation as
+  destinations).
+- A single invalid line is reported with its line number and applies
+  **nothing**: malformed lines, ports outside 1–65535 and duplicate local
+  ports are rejected.
+
+Saving (`:w`) runs the apply as one unit:
+
+1. parse the buffer (on errors nothing is uploaded and nothing changes);
+2. upload it to `<workspace-profile>/forward.txt` (the source of truth);
+3. check the local ports and kill the previous forward tunnel;
+4. start **one** detached `ssh -N` carrying a `-L` per line, with
+   `ExitOnForwardFailure=yes`;
+5. wait until the tunnel verifiably accepts connections. If ssh dies (a busy
+   port, a reserved port, rejected auth), the **previous forward set is
+   restored** and ssh's own stderr is reported.
+
+Ports are checked before the old tunnel is killed, so an obvious conflict
+leaves the old forwards running; a bind failure that only surfaces while ssh
+starts is rolled back to the previous set. Either way there is no
+half-applied state — all forwards live in one `ssh -N` process. Example: a
+dev server listening on the remote `127.0.0.1:3000`:
+
+```text
+3000 = 127.0.0.1:3000
+```
+
+Save, then open `http://127.0.0.1:3000` locally. `:SshDevStatus` reports the
+current set, e.g.
+`forwards: up (3080 -> 127.0.0.1:3080, 5432 -> db.internal:5432)`.
+
+The forward tunnel is stopped by `:SshDevStop` and when the local nvim exits
+— except when the UI attached via `:connect` (the local nvim server stops as
+the UI attaches, and the detached tunnel must survive). With
+`forward_on_connect = true` (default) every `:SshDevConnect` / `:SshDevAttach`
+re-reads forward.txt and re-applies the forwards automatically; when every
+port is already listening, the set is assumed to be leftovers from the
+previous session and kept (force a clean re-apply with `:SshDevForward` +
+`:w`). The forwards are ordinary client-side ssh processes, independent of
+the nvim server, so the file can also be reopened and re-applied while the
+remote server is not running (pass `[dest] [workspace]` when no session is
+active).
 
 **Inside the attached session** (`:SshDevConnect` with the default
 `attach = "auto"`) the same command just works: the typed command runs in the
 remote nvim, where `:SshDevForward` opens the very same forward.txt (it lives
 on the server) and each save is pushed over an RPC control channel to the
 client, which applies it and reports the outcome back into the attached UI.
+If that channel is unavailable, the fallback is: `:detach` (the server keeps
+running), run `:SshDevForward` + `:w` in a new local nvim, then
+`:SshDevAttach`.
 
-Reconnecting re-applies them for you: with `forward_on_connect` (default on)
-every `:SshDevConnect`/`:SshDevAttach` re-reads the workspace's forward.txt and
-re-starts its forwards automatically; already-listening leftovers from a
-previous session are kept (force a clean re-apply with `:SshDevForward` +
-`:w`).
+Common failures:
+
+| Symptom | Meaning / fix |
+| --- | --- |
+| `cannot forward: local port(s) … already in use` | a foreign process holds the port (often an ssh left by a crash); the old forwards keep running. Find it with `ss -ltn` / `netstat -an`, then save again |
+| `the forward tunnel … died (exit N): …` | authoritative ssh error (unbindable port, rejected auth). A rejected password already dropped the cache; the next connect asks again |
+| `the forwards … did not answer within 30s` | very slow link: the tunnel is not dead; check `:SshDevStatus` |
+| `5432 = db.internal:5432` does not connect | the target is resolved **on the server** — verify it there with `nc -vz db.internal 5432`; check the local listener on port 5432 |
+| forwards did not come back after reconnecting | `forward_on_connect = false`, or every port was already listening (kept as leftovers); force a save |
+
+Full implementation notes: [docs/port-forwarding.md](docs/port-forwarding.md).
 
 ### Environment variables (`:SshDevEnv`)
 
-The workspace's variables live next to forward.txt, in the remote workspace
-profile — `<workspace-profile>/env.txt` — and are edited through a local
-mirror:
+A workspace can declare environment variables in
+`<workspace-profile>/env.txt`, next to forward.txt. `:SshDevEnv` opens a local
+mirror of that file:
 
 ```vim
-:SshDevEnv                           " open (or create) env.txt for edit
+:SshDevEnv                           " active session's workspace (fastest, no probe)
+:SshDevEnv me@myhost                 " that destination; workspace from setup()
+:SshDevEnv me@myhost ~/src/app       " fully explicit, no active session needed
 ```
+
+```lua
+require('sshdev').env({ dest = 'me@myhost', workspace = '~/src/app' })
+```
+
+`[dest]` / `[workspace]` follow the same rules as `:SshDevForward` (named
+`remotes` entries work; `--auth=password` is accepted; `--nvim-profile` is
+irrelevant). A new workspace gets an all-commented template. One variable per
+line:
 
 ```text
 # one variable per line: KEY=VALUE (values are used verbatim)
@@ -236,34 +319,77 @@ DATABASE_URL=postgres://127.0.0.1:5432/app
 PATH=/opt/tools/bin:/usr/bin:/bin
 ```
 
-`#` lines and blank lines are ignored. A value is everything after the first
-`=` — spaces, `#` and `=` are kept, quotes are **not** stripped and `$VAR` is
-**not** expanded. Invalid lines are reported with line numbers and change
-nothing; duplicate keys and the keys sshdev needs itself (`SSHDEV_*`,
-`XDG_*`, `NVIM_APPNAME`, `SSH_ASKPASS*`, `HOME`) are rejected.
+Format rules:
 
-Saving applies the variables in two places:
+- `KEY` must match `[A-Za-z_][A-Za-z0-9_]*`.
+- A value is **everything after the first `=`**, used verbatim: spaces, `#`,
+  `=` and quotes are kept, `$VAR` is **not** expanded and quotes are **not**
+  stripped. A value may be empty.
+- `#` lines and blank lines are ignored; CRLF line endings and a UTF-8 BOM are
+  tolerated.
+- One invalid line reports its line number and applies **nothing** (the
+  remote file and the running environment stay unchanged). Values are never
+  echoed in error messages — a malformed line may be a mistyped secret.
+- Duplicate keys are rejected, and so are the keys sshdev needs itself:
+  `SSHDEV_*`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+  `XDG_CACHE_HOME`, `NVIM_APPNAME`, `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and
+  `HOME`.
 
-- **every ssh/scp command** sshdev runs for this workspace exports them at the
-  top of the remote script (so downloads, plugin installs and the server all
+Saving applies the variables everywhere sshdev can reach:
+
+- **future ssh/scp scripts** for this workspace export them at the top of the
+  remote script (so the nvim download, plugin install and server start all
   see them);
-- **the running remote server** gets them through the RPC control channel:
+- a **server started later** inherits them **before** your config loads, so
+  config-time `vim.env` reads work on the next `:SshDevConnect`;
+- a **running server** receives them through the RPC control channel:
   `vim.env` is updated, so LSPs, `:terminal` and `jobstart` children started
   from now on inherit them. Already-running LSPs need a restart; values read
   during nvim startup need a server restart (`:SshDevConnect!`).
 
-A server started later inherits the variables **before** your config loads, so
-config-time `vim.env` reads work on the next `:SshDevConnect`. With
-`env_on_connect` (default on) every `:SshDevConnect`/`:SshDevAttach` re-reads
-env.txt and injects it; removed lines unset the variable at runtime.
+Without a running server (or when no control channel is available), the file
+is only persisted; the next `:SshDevConnect` starts the server with it. With
+`env_on_connect = true` (default) every `:SshDevConnect` / `:SshDevAttach`
+re-reads env.txt and injects it; lines removed from the file unset the
+variable at runtime (a server started by an older sshdev has no key manifest
+for that — restart it with `:SshDevConnect!`). `env_on_connect = false` limits
+injection to explicit saves in the current nvim session.
+
+Example: point a remote process at a service forwarded by
+`:SshDevForward`:
+
+```text
+DATABASE_URL=postgres://127.0.0.1:5432/app
+```
+
+Save, then restart the LSP (or `:SshDevConnect!` for config-time reads) and
+processes started from the remote session see the variable. `:SshDevStatus`
+shows `env: N variable(s) injected (<dest>)`.
 
 **Inside the attached session**, `:SshDevEnv` opens the very same file on the
-server; a save applies immediately there and pushes the update back to the
-client through the control channel.
+server; a save applies it there immediately and pushes the update back to the
+client through the control channel (refreshing the local mirror and the
+active map). If the channel is gone, the server-side save still applies; the
+client catches up on the next connect.
 
 The file may hold secrets: the local mirror and the remote copy are written
-with mode 0600, the buffer uses no swap/undo file, and values are never
-logged.
+with mode **0600** (the remote copy is explicitly re-`chmod`ed after every
+upload), the buffer uses no swap/undo file, and values are never logged. The
+values do appear in the environment of the local ssh/scp children sshdev
+spawns for this workspace (a documented trade-off); the remote commands
+receive them through the exported script prefix.
+
+Troubleshooting:
+
+| Symptom | Meaning / fix |
+| --- | --- |
+| a new variable is not visible in a running LSP | the LSP was started with the old environment; restart the LSP client |
+| a removed variable is still set | the server predates the key manifest; restart with `:SshDevConnect!` |
+| nothing was applied after a save | the notification lists the invalid lines; fix them and `:w` again |
+| `HOME` / `XDG_*_HOME` / `SSHDEV_*` rejected | reserved: they would break the transport or the profile isolation |
+| the variable exists in the remote shell but not in `vim.env` | the command ran before the runtime push; reconnect or restart the server |
+
+Full implementation notes: [docs/environment.md](docs/environment.md).
 
 ### Telescope
 
@@ -294,7 +420,7 @@ or `:lua require('telescope').extensions.sshdev.connections()`.
         ├── nvim-profile -> ../../nvim-profiles/<nvim-profile-key>/
         ├── nvim-profile.txt  workspace.txt  client-host
         ├── session.lua                         server-side session helper
-        ├── session.vim  forward.txt  last_used
+        ├── session.vim  forward.txt  env.txt  last_used
         └── server.pid  server.addr  server.log
 ```
 
@@ -511,10 +637,13 @@ Notes:
   content hash: changing them creates a new nvim profile (a one-time install).
 - `nvim_profile` is normally `'auto'`; pin a key to reuse a specific existing
   profile for a new workspace.
+- `forward_on_connect` / `env_on_connect` (both default `true`) replay
+  `forward.txt` / `env.txt` after every connect/attach; disable them to apply
+  only explicit saves in the current nvim session.
 - History entries keep the **full destination including the ssh port**, so
   picking one reconnects to the right port.
 - `env.txt` values are injected into every ssh-run script and into the remote
-  server. Keys sshdev reserves (`SSHDEV_*`, `XDG_*`, `NVIM_APPNAME`,
+  server. Keys sshdev reserves (`SSHDEV_*`, `XDG_*_HOME`, `NVIM_APPNAME`,
   `SSH_ASKPASS*`, `HOME`) are rejected; a saved variable reaches a running
   LSP/terminal only after restarting it, and config-time reads need a server
   restart (`:SshDevConnect!`).
@@ -553,6 +682,28 @@ non-interactive attempt, asks for the password once and retries. Set
 `auth = 'password'` to skip the failed round trip, or `--auth=password`
 for one connection. `:checkhealth sshdev` verifies your client supports
 the fallback.
+
+**How do I reach a service running on the remote host?**
+Use `:SshDevForward`, add `3000 = 127.0.0.1:3000`, save, then open
+`http://127.0.0.1:3000`. The target is resolved on the server, so a service
+on the server's private network works too (`5432 = db.internal:5432`).
+
+**Where do I set environment variables for the remote session?**
+`:SshDevEnv` (or edit `env.txt` in the remote workspace profile directly).
+Saving applies the variables to a running server's `vim.env` and to every
+later ssh-run script. The file is not part of the nvim profile, so editing it
+never triggers a config upload or plugin reinstall.
+
+**Do `:SshDevForward` / `:SshDevEnv` need a running server?**
+No. Both edit files in the workspace profile; forwards are client-side ssh
+processes and env changes take effect at the next server start. Inside an
+attached session the commands transparently use the control channel.
+
+**Why do quotes / `$VAR` in `env.txt` not behave like a shell?**
+Values are used verbatim: quotes are kept and variables are not expanded. The
+file is a plain `KEY=VALUE` list, not a shell script — quote/expansion
+semantics would differ between the local mirror, the remote export and
+`vim.env`.
 
 **How do I get rid of old nvim profiles?**
 Each config edit creates a new `nvim-profiles/--…--` directory (the old one is
