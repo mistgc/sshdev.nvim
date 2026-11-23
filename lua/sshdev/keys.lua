@@ -2,7 +2,7 @@
 ---
 --- Two different, deliberately OPAQUE keys:
 ---
----   nvim profile       --<local-hostname>-<nvim-version>-<hash8-config-content>--
+---   nvim profile       --<local-hostname>--<nvim-version>--<hash8-config-content>--
 ---   workspace profile  --<local-hostname>--<workspace-path>--
 ---
 --- Keys are directory names below <remote_root>/nvim-profiles and
@@ -52,7 +52,7 @@ function M.config_hash8(config_hash)
   return Util.hash8(config_hash)
 end
 
----Nvim profile key: "--<local-hostname>-<nvim-version>-<hash8-config-content>--".
+---Nvim profile key: "--<local-hostname>--<nvim-version>--<hash8-config-content>--".
 ---@param local_hostname string
 ---@param nvim_version string e.g. "v0.12.6"
 ---@param hash8 string at least 8 hex chars (only the first 8 are used)
@@ -64,7 +64,7 @@ function M.nvim_profile_key(local_hostname, nvim_version, hash8)
   if not short then
     error('sshdev: nvim profile key needs at least 8 hex characters of config hash', 0)
   end
-  return '--' .. host .. '-' .. version .. '-' .. short .. '--'
+  return '--' .. host .. '--' .. version .. '--' .. short .. '--'
 end
 
 ---Workspace profile key: "--<local-hostname>--<workspace-path>--".
@@ -82,7 +82,7 @@ end
 ---@return string? err
 function M.validate_nvim_profile_key(key)
   if type(key) ~= 'string' or key == '' then
-    return false, 'an nvim profile key must be a non-empty string like "--<host>-<version>-<hash8>--"'
+    return false, 'an nvim profile key must be a non-empty string like "--<host>--<version>--<hash8>--"'
   end
   if #key > 200 then
     return false, 'the nvim profile key is too long'

@@ -3,7 +3,7 @@
 --- Two-level profile model:
 ---
 ---   nvim profile       reusable (config content + nvim version + client host):
----                      <root>/nvim-profiles/--<host>-<version>-<hash8>--/
+---                      <root>/nvim-profiles/--<host>--<version>--<hash8>--/
 ---   workspace profile  per (client host, workspace): session + server state:
 ---                      <root>/workspace-profiles/--<host>--<ws-path>--/
 ---

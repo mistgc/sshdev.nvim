@@ -291,7 +291,7 @@ end)
 
 T.describe('config nvim_profile / workspace_profile', function()
   eq(Config.build({ nvim_profile = 'auto' }).nvim_profile, 'auto')
-  local key = '--DESKTOP-1-v0.12.6-1a2b3c4d--'
+  local key = '--DESKTOP-1--v0.12.6--1a2b3c4d--'
   eq(Config.build({ nvim_profile = key }).nvim_profile, key)
   eq(Config.build({ workspace_profile = 'fixed' }).workspace_profile, 'fixed')
   for _, bad in ipairs({ 'nope', '--a--/', '--../x--', 42 }) do
@@ -463,17 +463,17 @@ end)
 
 ---------------------------------------------------------------- keys
 
-T.describe('keys: nvim profile key --<host>-<version>-<hash8>--', function()
+T.describe('keys: nvim profile key --<host>--<version>--<hash8>--', function()
   eq(Keys.nvim_profile_key('DESKTOP-1', 'v0.12.6', '1a2b3c4d'),
-    '--DESKTOP-1-v0.12.6-1a2b3c4d--')
+    '--DESKTOP-1--v0.12.6--1a2b3c4d--')
   eq(Keys.nvim_profile_key('laptop', 'nightly', '0123456789abcdef'),
-    '--laptop-nightly-01234567--')
+    '--laptop--nightly--01234567--')
   -- the host half is sanitized (dots/underscores are legal path characters),
   -- the version must be path-safe
   eq(Keys.nvim_profile_key('my host.local', 'v0.12.6', 'deadbeef'),
-    '--my-host.local-v0.12.6-deadbeef--')
+    '--my-host.local--v0.12.6--deadbeef--')
   ok(not pcall(Keys.nvim_profile_key, 'h', 'v1', 'zz'), 'non-hex hash rejected')
-  -- the workspace key keeps the double-dash delimiters
+  -- the workspace key uses the same "--" segment delimiters
   eq(Keys.workspace_profile_key('laptop', '/home/me/app'), '--laptop--home-me-app--')
 end)
 
@@ -486,7 +486,7 @@ T.describe('keys: validation', function()
   not_ok(Keys.is_valid_version('a/b'))
   not_ok(Keys.is_valid_version('a\tb'))
 
-  local key = '--DESKTOP-1-v0.12.6-1a2b3c4d--'
+  local key = '--DESKTOP-1--v0.12.6--1a2b3c4d--'
   eq(select(1, Keys.validate_nvim_profile_key(key)), true)
   for _, bad in ipairs({ 'nope', '--a--/', '--../x--', '--a b--', '-- ' .. key }) do
     eq(select(1, Keys.validate_nvim_profile_key(bad)), false, ('rejects %q'):format(bad))
@@ -506,8 +506,8 @@ T.describe('layout: nvim profile / workspace profile paths', function()
   }))
   eq(l.root, '/home/me/.sshdev.nvim')
   eq(l.bin_dir, '/home/me/.sshdev.nvim/nvim-bins/v0.12.6')
-  eq(l.nvim_profile_key, '--laptop-v0.12.6-01234567--')
-  eq(l.nvim_profile, '/home/me/.sshdev.nvim/nvim-profiles/--laptop-v0.12.6-01234567--')
+  eq(l.nvim_profile_key, '--laptop--v0.12.6--01234567--')
+  eq(l.nvim_profile, '/home/me/.sshdev.nvim/nvim-profiles/--laptop--v0.12.6--01234567--')
   eq(l.nvim_bin_link, l.nvim_profile .. '/nvim-bin')
   eq(l.nvim_bin_link_target, '../../nvim-bins/v0.12.6')
   eq(l.nvim_config, l.nvim_profile .. '/nvim-config')
@@ -524,7 +524,7 @@ T.describe('layout: nvim profile / workspace profile paths', function()
   eq(l.workspace_profile_key, '--laptop--home-me-src-app--')
   eq(l.workspace_profile, '/home/me/.sshdev.nvim/workspace-profiles/--laptop--home-me-src-app--')
   eq(l.nvim_profile_link, l.workspace_profile .. '/nvim-profile')
-  eq(l.nvim_profile_link_target, '../../nvim-profiles/--laptop-v0.12.6-01234567--')
+  eq(l.nvim_profile_link_target, '../../nvim-profiles/--laptop--v0.12.6--01234567--')
   eq(l.workspace_file, l.workspace_profile .. '/workspace.txt')
   eq(l.nvim_profile_key_file, l.workspace_profile .. '/nvim-profile.txt')
   eq(l.ws_client_host_file, l.workspace_profile .. '/client-host')
@@ -540,7 +540,7 @@ T.describe('layout: nvim profile / workspace profile paths', function()
 end)
 
 T.describe('layout: explicit nvim profile reuse', function()
-  local key = '--other-host-v0.11.3-deadbeef--'
+  local key = '--other-host--v0.11.3--deadbeef--'
   local l = assert(Layout.build({
     home = '/home/me',
     hostname = 'laptop',
@@ -554,7 +554,7 @@ T.describe('layout: explicit nvim profile reuse', function()
   eq(l.nvim_profile, '/home/me/.sshdev.nvim/nvim-profiles/' .. key)
   eq(l.nvim_profile_link_target, '../../nvim-profiles/' .. key)
   -- auto key is still derivable for fallback/reporting
-  eq(Layout.auto_nvim_profile_key(l), '--laptop-v0.12.6-01234567--')
+  eq(Layout.auto_nvim_profile_key(l), '--laptop--v0.12.6--01234567--')
 end)
 
 T.describe('layout: workspace options and validation', function()
@@ -578,7 +578,7 @@ T.describe('layout: workspace options and validation', function()
   -- token is sanitized
   eq(
     assert(Layout.build(vim.tbl_extend('force', base, { token = 'a-b/c d' }))).staging_dir,
-    '/home/me/.sshdev.nvim/nvim-profiles/--laptop-v0.12.6-01234567--/.staging-abcd'
+    '/home/me/.sshdev.nvim/nvim-profiles/--laptop--v0.12.6--01234567--/.staging-abcd'
   )
   -- invalid inputs
   local function rejects(overrides, why)
@@ -855,7 +855,7 @@ T.describe('remote scripts: listing executes against a fixture tree', function()
       write_file(dir .. '/config-hash', fields.config_hash .. '\n')
     end
   end
-  local np_key = '--desk-1-v0.12.6-aaaabbbb--'
+  local np_key = '--desk-1--v0.12.6--aaaabbbb--'
   profile(ws_dir .. '/--desk-1--home-me-a--', {
     host = 'desk-1', workspace = '/home/me/a', nvim_profile = np_key, last_used = 100, session = true,
   })
@@ -876,8 +876,8 @@ T.describe('remote scripts: listing executes against a fixture tree', function()
   nvim_profile(np_dir .. '/' .. np_key, {
     host = 'desk-1', version = 'v0.12.6', ready = '0123456789abcdef', config_hash = '0123456789abcdef',
   })
-  nvim_profile(np_dir .. '/--desk-1-v0.12.6-eeeeffff--', { host = 'desk-1' })
-  nvim_profile(np_dir .. '/--desk-v0.12.6-ccccdddd--', { host = 'desk', version = 'v0.12.6' })
+  nvim_profile(np_dir .. '/--desk-1--v0.12.6--eeeeffff--', { host = 'desk-1' })
+  nvim_profile(np_dir .. '/--desk--v0.12.6--ccccdddd--', { host = 'desk', version = 'v0.12.6' })
 
   local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-list')
   Util.rmrf(dir)
@@ -914,7 +914,7 @@ T.describe('remote scripts: listing executes against a fixture tree', function()
   eq(by_key[np_key].version, 'v0.12.6', 'version parsed')
   eq(by_key[np_key].ready_hash, '0123456789abcdef', 'ready hash parsed')
   eq(by_key[np_key].workspace_count, 2, 'workspace reference count')
-  ok(by_key['--desk-v0.12.6-ccccdddd--'] == nil, 'other host profile excluded')
+  ok(by_key['--desk--v0.12.6--ccccdddd--'] == nil, 'other host profile excluded')
 
   Util.rmrf(fixture)
   Util.rmrf(dir)
@@ -1686,7 +1686,7 @@ T.describe('history: v2 record / list / remove', function()
     dest = 'a@h1',
     workspace = '/w1',
     workspace_profile_key = '--h1--w1--',
-    nvim_profile_key = '--h1-v0.12.6-aaaa1111--',
+    nvim_profile_key = '--h1--v0.12.6--aaaa1111--',
   })
   History.record(cfg, { dest = 'b@h2', workspace = '/w2' })
   local list = History.list()
@@ -1697,14 +1697,14 @@ T.describe('history: v2 record / list / remove', function()
     dest = 'a@h1',
     workspace = '/w1',
     workspace_profile_key = '--h1--w1--',
-    nvim_profile_key = '--h1-v0.12.6-aaaa1111--',
+    nvim_profile_key = '--h1--v0.12.6--aaaa1111--',
   })
   list = History.list()
   eq(#list, 2)
   eq(list[1].dest, 'a@h1')
   eq(list[1].count, 2)
   eq(list[1].workspace_profile_key, '--h1--w1--')
-  eq(list[1].nvim_profile_key, '--h1-v0.12.6-aaaa1111--')
+  eq(list[1].nvim_profile_key, '--h1--v0.12.6--aaaa1111--')
 
   History.record(cfg, { dest = 'c@h3', workspace = '/w3' })
   History.record(cfg, { dest = 'd@h4', workspace = '/w4' })
@@ -1758,7 +1758,7 @@ T.describe('history: remote scan merge (user isolation)', function()
       dest = 'me@h:2222',
       workspace = '/w1',
       workspace_profile_key = '--me--w1--',
-      nvim_profile_key = '--me-v0.12.6-local111--',
+      nvim_profile_key = '--me--v0.12.6--local111--',
       last_used = 100,
       count = 3,
     },
@@ -1770,7 +1770,7 @@ T.describe('history: remote scan merge (user isolation)', function()
     {
       key = '--me--w1--',
       workspace = '/w1',
-      nvim_profile_key = '--me-v0.12.6-remote222--',
+      nvim_profile_key = '--me--v0.12.6--remote222--',
       last_used = 200,
       has_session = true,
     },
@@ -1783,7 +1783,7 @@ T.describe('history: remote scan merge (user isolation)', function()
   eq(merged[2].workspace, '/w1')
   eq(merged[2].source, 'remote+history')
   eq(merged[2].count, 3, 'local count kept')
-  eq(merged[2].nvim_profile_key, '--me-v0.12.6-remote222--', 'remote profile key wins')
+  eq(merged[2].nvim_profile_key, '--me--v0.12.6--remote222--', 'remote profile key wins')
   eq(merged[2].has_session, true)
   eq(merged[3].workspace, '/w-gone')
   eq(merged[3].stale, true)
@@ -1810,12 +1810,12 @@ T.describe('history: nvim profile key cache for completion', function()
   History.record(cfg, {
     dest = 'me@h:2222',
     workspace = '/w',
-    nvim_profile_key = '--me-v0.12.6-aaaa1111--',
+    nvim_profile_key = '--me--v0.12.6--aaaa1111--',
   })
-  History.cache_nvim_profiles('me@h', { '--me-v0.12.6-bbbb2222--' })
+  History.cache_nvim_profiles('me@h', { '--me--v0.12.6--bbbb2222--' })
   local keys = History.nvim_profile_keys('me@h:2222')
-  ok(vim.tbl_contains(keys, '--me-v0.12.6-aaaa1111--'), 'recorded key cached')
-  ok(vim.tbl_contains(keys, '--me-v0.12.6-bbbb2222--'), 'explicit cache entry found')
+  ok(vim.tbl_contains(keys, '--me--v0.12.6--aaaa1111--'), 'recorded key cached')
+  ok(vim.tbl_contains(keys, '--me--v0.12.6--bbbb2222--'), 'explicit cache entry found')
   eq(#keys, 2, 'keys deduplicated')
   eq(#History.nvim_profile_keys('other@host'), 0, 'cache is per destination')
 
@@ -1835,7 +1835,7 @@ T.describe('picker: connection items + history items', function()
   eq(items[2].kind, 'new')
 
   local merged_items = Picker.history_items(Config.build({}), 'me@h', {
-    { key = '--me--w--', workspace = '/w', nvim_profile_key = '--me-v0.12.6-aaaa1111--', last_used = 10 },
+    { key = '--me--w--', workspace = '/w', nvim_profile_key = '--me--v0.12.6--aaaa1111--', last_used = 10 },
   })
   eq(#merged_items, 2, 'one remote workspace + new')
   eq(merged_items[1].kind, 'workspace')
@@ -1885,12 +1885,12 @@ T.describe('picker: nvim profile reuse choice', function()
     on_choice(items[2])
   end
   Picker.prompt_nvim_profile({
-    { key = '--me-v0.12.6-aaaa1111--', version = 'v0.12.6', ready_hash = 'x', workspace_count = 2 },
+    { key = '--me--v0.12.6--aaaa1111--', version = 'v0.12.6', ready_hash = 'x', workspace_count = 2 },
   }, function(key)
     got = key
   end)
   Picker.choose = orig_choose
-  eq(got, '--me-v0.12.6-aaaa1111--')
+  eq(got, '--me--v0.12.6--aaaa1111--')
   eq(items_seen[1].kind, 'auto')
   eq(items_seen[2].kind, 'reuse')
   ok(items_seen[2].display:find('2 workspace', 1, true) ~= nil, 'workspace count shown')
@@ -1925,7 +1925,7 @@ T.describe('session: reuse decision for explicit nvim profiles', function()
   eq(Session.reuse_action(explicit_auto, { np_exists = true, np_ready = 'x' }), 'own')
   -- an existing, complete explicit profile is reused as-is
   local reused = assert(Layout.build(vim.tbl_extend('force', base, {
-    nvim_profile_key = '--me-v0.12.6-ffff0000--',
+    nvim_profile_key = '--me--v0.12.6--ffff0000--',
   })))
   eq(Session.reuse_action(reused, { np_exists = true, np_ready = 'ffff0000' }), 'reuse')
   -- missing / incomplete explicit profiles fall back to the auto profile
@@ -1935,7 +1935,7 @@ end)
 
 T.describe('session: auto nvim profile key', function()
   local key = assert(Session.auto_nvim_profile_key(Config.build({})))
-  ok(key:match('^%-%-[%w._-]+%-v?%d+%.%d+%.%d+%-%x%x%x%x%x%x%x%x%-%-$') ~= nil,
+  ok(key:match('^%-%-[%w._-]+%-%-v?%d+%.%d+%.%d+%-%-%x%x%x%x%x%x%x%x%-%-$') ~= nil,
     'auto key format: ' .. key)
   ok(key:find(Util.os_hostname(), 1, true) ~= nil, 'key namespaces the local hostname')
 end)

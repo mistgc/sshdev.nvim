@@ -2,7 +2,7 @@
 ---
 ---   <remote_root>/
 ---   ├── nvim-bins/<nvim-version>/
----   ├── nvim-profiles/--<host>-<version>-<hash8>--/
+---   ├── nvim-profiles/--<host>--<version>--<hash8>--/
 ---   │   ├── nvim-bin -> ../../nvim-bins/<version>
 ---   │   ├── nvim-config/  xdg/share/  xdg/state/  xdg/cache/
 ---   │   └── ...

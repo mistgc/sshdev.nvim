@@ -15,7 +15,7 @@ The remote state is split into two levels:
 	nvim profile	a REUSABLE bundle of the uploaded config + the plugin
 			instances + a link to one nvim release:
 			  <remote_root>/nvim-profiles/
-			    --<local-hostname>-<nvim-version>-<hash8-config-content>--
+			    --<local-hostname>--<nvim-version>--<hash8-config-content>--
 			The key is derived from the local hostname, the nvim
 			version and the CONTENT hash of the uploaded config,
 			so it is stable across `touch` and reused by every
@@ -185,7 +185,7 @@ To reuse a profile installed from another config state (e.g. pin a project to
 the plugins it was created with), pass its key: >
 
 	:SshDevProfiles me@myhost
-	:SshDevConnect me@myhost ~/src/second --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+	:SshDevConnect me@myhost ~/src/second --nvim-profile=--laptop--v0.12.6--1a2b3c4d--
 <
 The reused profile is immutable: sshdev never uploads the current config into
 it. If the key does not exist or never finished installing, sshdev warns and
@@ -456,7 +456,7 @@ REMOTE LAYOUT						*sshdev-layout*
     ├── nvim-bins/<nvim-version>/                 nvim releases (shared)
     │   ├── bin/nvim
     │   └── .platform                             OS/arch marker
-    ├── nvim-profiles/--<host>-<version>-<hash8>--/
+    ├── nvim-profiles/--<host>--<version>--<hash8>--/
     │   ├── nvim-bin -> ../../nvim-bins/<version>/  (relative symlink)
     │   ├── nvim-config/                          uploaded config
     │   ├── xdg/share/                            XDG_DATA_HOME (plugins)
@@ -509,7 +509,7 @@ Setup with defaults (all keys optional): >
 	  remotes = { work = 'me@work.example.com:2222' },
 	  workspace = '~/src/app',     -- default remote project directory
 	  workspace_profile = nil,     -- force the workspace profile dir name
-	  nvim_profile = 'auto',       -- "auto" | "--<host>-<version>-<hash8>--"
+	  nvim_profile = 'auto',       -- "auto" | "--<host>--<version>--<hash8>--"
 	  session = true,              -- save <workspace-profile>/session.vim
 	  restore_session = true,      -- restore it on start
 	  forward_on_connect = true,    -- re-apply forward.txt on (re)connect
@@ -546,7 +546,7 @@ workspace_profile ~
 nvim_profile ~
 	"auto" (default) derives the key from (local hostname, nvim version,
 	config content hash) and reuses an already installed profile for any
-	new workspace. Set an explicit "--<host>-<version>-<hash8>--" key to
+	new workspace. Set an explicit "--<host>--<version>--<hash8>--" key to
 	reuse one specific existing profile as-is. `profile` is accepted as a
 	deprecated alias for `workspace_profile`.
 

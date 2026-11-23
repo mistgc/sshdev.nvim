@@ -3,7 +3,7 @@
 --- Terminology:
 ---   nvim profile       reusable bundle of uploaded config + plugin instances
 ---                      + a link to one nvim version's binary:
----                        <remote_root>/nvim-profiles/--<host>-<version>-<hash8>--/
+---                        <remote_root>/nvim-profiles/--<host>--<version>--<hash8>--/
 ---   workspace profile  per (local host, workspace) session/server state:
 ---                        <remote_root>/workspace-profiles/--<host>--<ws-path>--/
 ---
@@ -51,7 +51,7 @@ end
 
 ---Connect to a remote workspace (like |:SshDevConnect|).
 ---opts: { dest = "[user@]host[:port]", workspace = "remote project dir",
----        nvim_profile = "--<host>-<version>-<hash8>--" (reuse an existing
+---        nvim_profile = "--<host>--<version>--<hash8>--" (reuse an existing
 ---        nvim profile), force = bool }
 function M.connect(opts)
   session().connect(opts)

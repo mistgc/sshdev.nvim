@@ -14,8 +14,8 @@ end
 ---argument shape.
 ---
 ---Flags may appear anywhere; at most two positional arguments remain:
----  :SshDevConnect me@host ~/src/app --nvim-profile=--me-v0.12.6-1a2b3c4d--
----  :SshDevConnect --nvim-profile --me-v0.12.6-1a2b3c4d-- me@host ~/src/app
+---  :SshDevConnect me@host ~/src/app --nvim-profile=--me--v0.12.6--1a2b3c4d--
+---  :SshDevConnect --nvim-profile --me--v0.12.6--1a2b3c4d-- me@host ~/src/app
 ---  :SshDevConnect me@host ~/src/app --auth=password
 ---@param o table user command args
 ---@return table|nil opts
@@ -39,7 +39,7 @@ local function parse_args(o)
     local auth = a:match('^%-%-auth=(.*)$')
     if inline then
       if inline == '' then
-        return nil, '--nvim-profile needs a value like --<host>-<version>-<hash8>--'
+        return nil, '--nvim-profile needs a value like --<host>--<version>--<hash8>--'
       end
       opts.nvim_profile = inline
       i = i + 1
@@ -62,7 +62,7 @@ local function parse_args(o)
     elseif a == '--nvim-profile' or a == '-p' then
       local n = fargs[i + 1]
       if not n or n == '' then
-        return nil, '--nvim-profile needs a value like --<host>-<version>-<hash8>--'
+        return nil, '--nvim-profile needs a value like --<host>--<version>--<hash8>--'
       end
       opts.nvim_profile = n
       i = i + 2

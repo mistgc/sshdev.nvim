@@ -26,7 +26,7 @@ The state on the remote host is split into two independent levels:
   the plugin data, keyed by
 
   ```
-  <remote_root>/nvim-profiles/--<local-hostname>-<nvim-version>-<hash8-config-content>--/
+  <remote_root>/nvim-profiles/--<local-hostname>--<nvim-version>--<hash8-config-content>--/
   ```
 
   The key contains the local hostname (isolation between laptops sharing one
@@ -116,7 +116,7 @@ With telescope (optional — enables the fuzzy pickers):
 :SshDevConnect work                  " a destination named in setup({ remotes = ... })
 :SshDevConnect me@myhost:2222 ~/src/app --auth=password
                                      " force password mode for this connection
-:SshDevConnect me@myhost ~/src/app --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+:SshDevConnect me@myhost ~/src/app --nvim-profile=--laptop--v0.12.6--1a2b3c4d--
                                      " new workspace reusing an existing nvim profile
 :SshDevConnect!                      " restart server, re-sync into the profile
 :SshDevAttach                        " attach to a RUNNING server, no bootstrap
@@ -155,14 +155,14 @@ explicitly:
 :SshDevProfiles me@myhost
 
 " create a new workspace that reuses an existing profile
-:SshDevConnect me@myhost ~/src/second --nvim-profile=--laptop-v0.12.6-1a2b3c4d--
+:SshDevConnect me@myhost ~/src/second --nvim-profile=--laptop--v0.12.6--1a2b3c4d--
 ```
 
 ```lua
 require('sshdev').connect({
   dest = 'me@myhost',
   workspace = '~/src/second',
-  nvim_profile = '--laptop-v0.12.6-1a2b3c4d--',
+  nvim_profile = '--laptop--v0.12.6--1a2b3c4d--',
 })
 ```
 
@@ -408,7 +408,7 @@ or `:lua require('telescope').extensions.sshdev.connections()`.
 │       ├── bin/nvim
 │       └── .platform                            OS/arch marker
 ├── nvim-profiles/
-│   └── --<local-hostname>-<nvim-version>-<hash8-config-content>--/
+│   └── --<local-hostname>--<nvim-version>--<hash8-config-content>--/
 │       ├── nvim-bin -> ../../nvim-bins/<nvim-version>/   (relative symlink)
 │       ├── nvim-config/                        uploaded config (NVIM_APPNAME)
 │       ├── xdg/share/                          XDG_DATA_HOME (plugins)
@@ -598,7 +598,7 @@ require('sshdev').setup({
 
   workspace = '~/src/app',   -- default remote project directory
   workspace_profile = nil,   -- force the workspace profile dir name
-  nvim_profile = 'auto',     -- 'auto' | '--<host>-<version>-<hash8>--' (reuse)
+  nvim_profile = 'auto',     -- 'auto' | '--<host>--<version>--<hash8>--' (reuse)
 
   session = true,            -- save <workspace-profile>/session.vim on exit
   restore_session = true,    -- restore it when the server starts

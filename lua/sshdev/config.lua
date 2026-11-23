@@ -45,7 +45,7 @@ M.defaults = {
   ---  "auto"              derive the key from (local hostname, nvim version,
   ---                      config content hash) -- the default, and what makes
   ---                      a new workspace reuse an already installed profile
-  ---  "--<host>-<version>-<hash8>--"  reuse that exact existing profile
+  ---  "--<host>--<version>--<hash8>--"  reuse that exact existing profile
   nvim_profile = 'auto',
 
   ---Save the remote nvim session to

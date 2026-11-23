@@ -51,7 +51,7 @@ split into two independent levels:
 │   ├── bin/nvim
 │   └── .platform                                 OS/arch marker
 ├── nvim-profiles/
-│   └── --<local-hostname>-<nvim-version>-<hash8>--/
+│   └── --<local-hostname>--<nvim-version>--<hash8>--/
 │       ├── nvim-bin -> ../../nvim-bins/<version> relative symlink
 │       ├── nvim-config/                          the uploaded config (as NVIM_APPNAME)
 │       ├── xdg/share/  xdg/state/  xdg/cache/    isolated XDG data/state/cache
@@ -67,7 +67,7 @@ split into two independent levels:
 ```
 
 - **nvim profile** (reusable): the key is
-  `--<local hostname>-<nvim version>-<first 8 hex of the config content hash>--`.
+  `--<local hostname>--<nvim version>--<first 8 hex of the config content hash>--`.
   The key *is* the config identity: editing config content (changing the
   hash) creates a new profile; `touch`ing files does not. The local hostname
   participates in the key so two laptops sharing one remote account never
