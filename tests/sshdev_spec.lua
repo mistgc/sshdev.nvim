@@ -2260,4 +2260,168 @@ T.describe('remote scripts: bootstrap round trip (simulated remote)', function()
   Util.rmrf(base)
 end)
 
+---------------------------------------------------------------- session / proxy
+
+local ProxyProto = require('sshdev.proxy_proto')
+
+T.describe('config: reconnect', function()
+  eq(Config.build({}).reconnect, true, 'reconnect is enabled by default')
+  eq(Config.build({ reconnect = false }).reconnect, false, 'reconnect can be turned off')
+  eq(Config.validate(Config.build({ reconnect = true })), nil)
+  local bad = Config.build({ reconnect = 'yes' })
+  eq(
+    Config.validate(bad),
+    'setup: "reconnect" must be a boolean',
+    'reconnect must be a boolean'
+  )
+end)
+
+T.describe('ssh.tunnel_args: session + proxy tunnels', function()
+  local cfg = Config.build({})
+  local parsed = { dest = 'me@host', user = 'me', host = 'host', port = 2222 }
+
+  local args = Ssh.tunnel_args(cfg, parsed, 40001, 50001)
+  local fwd = {}
+  for i, a in ipairs(args) do
+    if a == '-L' then
+      fwd[#fwd + 1] = args[i + 1]
+    end
+  end
+  eq(#fwd, 1, 'one -L for the plain session tunnel')
+  eq(fwd[1], '127.0.0.1:40001:127.0.0.1:50001')
+  ok(vim.tbl_contains(args, '-N'), 'no remote command')
+  ok(vim.tbl_contains(args, 'ControlMaster=no'), 'tunnels are never multiplexed')
+  ok(vim.tbl_contains(args, 'ExitOnForwardFailure=yes'), 'a failed bind kills the tunnel')
+  eq(args[#args], 'me@host', 'destination is the last argument')
+
+  local pargs = Ssh.proxy_tunnel_args(cfg, parsed, 41001, 41002, 50001)
+  fwd = {}
+  for i, a in ipairs(pargs) do
+    if a == '-L' then
+      fwd[#fwd + 1] = pargs[i + 1]
+    end
+  end
+  eq(#fwd, 2, 'the proxy tunnel forwards the UI stream and the control channel')
+  eq(fwd[1], '127.0.0.1:41001:127.0.0.1:50001')
+  eq(fwd[2], '127.0.0.1:41002:127.0.0.1:50001')
+  eq(pargs[#pargs], 'me@host', 'destination stays last with two forwards')
+end)
+
+T.describe('proxy_proto: msgpack framing', function()
+  local frames = {
+    vim.mpack.encode({ 2, 'nvim_input', { 'abc' } }),
+    vim.mpack.encode({ 0, 7, 'nvim_ui_attach', { 116, 62, { rgb = false } } }),
+    vim.mpack.encode({ 1, 7, vim.NIL, vim.NIL }),
+    vim.mpack.encode(vim.tbl_map(function(i)
+      return { i, 'x', i % 2 == 0 }
+    end, vim.fn.range(1, 20))), -- array16 header
+    vim.mpack.encode({ 2, 'nvim_ui_attach', { 200, 60, {
+      term_name = 'xterm-256color',
+      term_colors = 256,
+      ext_linegrid = true,
+      stdin_tty = true,
+      stdout_tty = true,
+    } } }),
+    vim.mpack.encode({ 2, 'nvim_paste', { string.rep('y', 300) } }), -- str16
+    vim.mpack.encode({ 2, 'nvim_ui_try_resize', { -1, 2.5 } }),
+  }
+  local stream = table.concat(frames)
+  local count = 0
+  local rest = stream
+  while rest ~= '' do
+    local frame, next_rest, good = ProxyProto.next_frame(rest)
+    ok(good, 'stream stays parseable at frame ' .. tostring(count + 1))
+    eq(type(frame), 'string')
+    count = count + 1
+    rest = next_rest
+  end
+  eq(count, #frames, 'every frame is split exactly once')
+
+  local first = frames[1]
+  for i = 1, #first - 1 do
+    local len = ProxyProto.frame_length(first:sub(1, i), 1)
+    eq(len, nil, ('prefix %d/%d must be incomplete'):format(i, #first))
+  end
+  eq(ProxyProto.frame_length(first, 1), #first)
+
+  -- fixed-width scalars and wire types vim.mpack does not emit by itself
+  eq(ProxyProto.frame_length('\255', 1), 1, 'negative fixint')
+  eq(ProxyProto.frame_length('\202\000\000\000\000', 1), 5, 'float32')
+  eq(ProxyProto.frame_length('\203\000\000\000\000\000\000\000\000', 1), 9, 'float64')
+  eq(ProxyProto.frame_length('\196\003abc', 1), 5, 'bin8')
+  eq(ProxyProto.frame_length('\197\000\003abc', 1), 6, 'bin16')
+  eq(ProxyProto.frame_length('\199\001\001\170', 1), 4, 'ext8')
+  eq(ProxyProto.frame_length('\220\000\001\192', 1), 4, 'array16 with one nil')
+  eq(ProxyProto.frame_length('\220\000', 1), nil, 'truncated array16 header')
+  eq(ProxyProto.frame_length('\218\000', 1), nil, 'truncated str16 header')
+
+  local _, good = ProxyProto.frame_length('\193', 1)
+  eq(good, false, '0xc1 is not a msgpack type')
+end)
+
+T.describe('proxy_proto: message info / ui events', function()
+  local input = ProxyProto.message_info(vim.mpack.encode({ 2, 'nvim_input', { 'i' } }))
+  eq(input.kind, 2)
+  eq(input.method, 'nvim_input')
+  eq(ProxyProto.is_input(input), true, 'input is dropped while reconnecting')
+  eq(
+    ProxyProto.is_input(ProxyProto.message_info(vim.mpack.encode({ 2, 'nvim_paste', { 'x' } }))),
+    true,
+    'paste is input too'
+  )
+  local resize_info = ProxyProto.message_info(
+    vim.mpack.encode({ 2, 'nvim_ui_try_resize', { 1, 2 } })
+  )
+  eq(ProxyProto.is_input(resize_info), false, 'resize is replayed')
+  eq(
+    ProxyProto.is_input(ProxyProto.message_info(vim.mpack.encode({ 0, 1, 'nvim_input', { 'x' } }))),
+    false,
+    'requests are never treated as input notifications'
+  )
+
+  local attach = ProxyProto.message_info(vim.mpack.encode({
+    2,
+    'nvim_ui_attach',
+    { 116, 62, { ext_linegrid = true } },
+  }))
+  eq(attach.method, 'nvim_ui_attach')
+  eq(attach.args[1], 116)
+  eq(attach.args[2], 62)
+  eq(attach.args[3].ext_linegrid, true)
+
+  local title = vim.mpack.decode(ProxyProto.encode_title('sshdev: reconnecting…'))
+  eq(title[1], 2)
+  eq(title[2], 'redraw')
+  eq(title[3][1][1], 'set_title')
+  eq(title[3][1][2][1], 'sshdev: reconnecting…')
+end)
+
+T.describe('reconnect wiring (static)', function()
+  local proxy_script = REPO_ROOT .. '/scripts/ui_proxy.lua'
+  local f = io.open(proxy_script, 'r')
+  ok(f ~= nil, 'scripts/ui_proxy.lua exists')
+  if f then
+    local src = f:read('*a')
+    f:close()
+    ok(src:find("nvim_ui_attach", 1, true) ~= nil, 'replays the UI attach upstream')
+    ok(src:find("nvim_ui_try_resize", 1, true) ~= nil, 'tracks UI resizes')
+    ok(src:find('Proto.is_input', 1, true) ~= nil, 'drops input while reconnecting')
+    ok(src:find('parent_pid', 1, true) ~= nil, 'reaps the detached local server')
+    ok(src:find('SSHDEV_PROXY_CONFIG', 1, true) ~= nil, 'reads its JSON configuration')
+    ok(src:find('ExitOnForwardFailure', 1, true) == nil, 'the ssh argv comes from ssh.lua')
+    ok(loadfile(proxy_script) ~= nil, 'the proxy script compiles')
+  end
+
+  local session_src = io.open(REPO_ROOT .. '/lua/sshdev/session.lua', 'r')
+  ok(session_src ~= nil)
+  if session_src then
+    local src = session_src:read('*a')
+    session_src:close()
+    ok(src:find("require('sshdev.proxy')", 1, true) ~= nil, 'session loads the proxy manager')
+    ok(src:find('run_attach_proxy', 1, true) ~= nil, 'the connect strategy has a proxy path')
+    ok(src:find('start_control_keeper', 1, true) ~= nil, 'control channel is re-opened')
+    ok(src:find('Proxy.log_tail', 1, true) ~= nil, 'proxy failures report their log')
+  end
+end)
+
 return T

@@ -125,6 +125,18 @@ M.defaults = {
   ---  "command"   do not attach; just print the command to run
   attach = 'auto',
 
+  ---Keep the local UI alive when the ssh link drops. With this enabled
+  ---(the default), the `connect` attach strategy goes through a small
+  ---local RPC relay that owns the ssh tunnel. The relay keeps the UI's
+  ---channel open, rebuilds the tunnel when the network drops and replays
+  ---the UI attach on the new link, so the local nvim process survives and
+  ---the remote nvim session continues untouched. `false` restores the
+  ---direct `:connect` behaviour, where losing the tunnel terminates the
+  ---local nvim (that is what made a network flap look like a crash).
+  ---Only the `connect` strategy is proxied; the `terminal` strategy keeps
+  ---its explicit UI-client terminal and is not auto-reconnected.
+  reconnect = true,
+
   ---Record every connection and offer a picker when :SshDevConnect is called
   ---without arguments (telescope when available, vim.ui.select otherwise).
   history = true,
@@ -332,6 +344,9 @@ function M.validate(cfg)
   end
   if not vim.tbl_contains({ 'auto', 'terminal', 'connect', 'command' }, cfg.attach) then
     return 'setup: "attach" must be one of "auto", "terminal", "connect", "command"'
+  end
+  if type(cfg.reconnect) ~= 'boolean' then
+    return 'setup: "reconnect" must be a boolean'
   end
   if type(cfg.timeouts) ~= 'table' then
     return 'setup: "timeouts" must be a table of seconds'

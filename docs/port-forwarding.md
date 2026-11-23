@@ -84,11 +84,18 @@ The two tunnel-specific options each have an explicit rationale:
 
 `spawn_detached_tunnel()` spawns via
 `jobstart(args, { detach = true, env, … })`: **detachment is mandatory** —
-the default attach (`:connect`) stops the local nvim server, and the
-tunnel must not die with it. When a password is cached, `env` injects
-the askpass triple (`SSH_ASKPASS` / `SSH_ASKPASS_REQUIRE=force` /
-`SSHDEV_PASS`) so even a terminal-less detached process authenticates
-(verified on Windows OpenSSH 9.5).
+the default attach (`:connect`) detaches the local nvim server (it keeps
+running headless), and the tunnel must not die with it. When a password is
+cached, `env` injects the askpass triple (`SSH_ASKPASS` /
+`SSH_ASKPASS_REQUIRE=force` / `SSHDEV_PASS`) so even a terminal-less
+detached process authenticates (verified on Windows OpenSSH 9.5).
+
+With `reconnect = true` the session's UI tunnel is owned by the local
+reconnect relay instead (`lua/sshdev/proxy.lua`, `scripts/ui_proxy.lua`),
+which spawns the same `ssh -N -L` argv plus the control forward and rebuilds
+it on a network drop. The forwards described in this document are a
+*separate* tunnel and are re-applied by the control keeper after a reconnect
+(see [remote-connection.md](remote-connection.md) §8.6).
 
 The returned handle:
 
@@ -167,8 +174,11 @@ the UI (see [remote-connection.md](remote-connection.md) §4 and §8).
 - `VimLeavePre → teardown_local()`: kill the session tunnel, close the
   control channel, stop the user forwards; **exception**: right after a
   successful `:connect` (`state.attached`) the teardown is skipped —
-  the local server stops as the UI attaches, the tunnel must survive,
-  and the remote server keeps running.
+  the local server is detached and keeps running headless, the tunnel must
+  survive, and the remote server keeps running.
+- With `reconnect = true`, a network drop kills this forwards tunnel too; the
+  control keeper re-opens the channel through the relay's rebuilt tunnel and
+  re-applies `forward.txt` automatically (remote-connection.md §8.6).
 - `:SshDevStop`: explicitly kills the tunnel (plus the control channel
   and user forwards) and `SIGTERM`s the remote server (saving the
   session).
@@ -474,7 +484,7 @@ Every end point of the user-forward tunnel:
 | saving forward.txt | replaced as a unit (kill + start, one process swapped for another) |
 | `:SshDevStop` | `Forward.kill()`, stopped together with the session tunnel |
 | local nvim exit (`VimLeavePre`) | same; reopen `:SshDevForward` and save to re-establish, or wait for `forward_on_connect` |
-| right after a successful `:connect` | `teardown_local` skips (the tunnel must survive the local server stopping) |
+| right after a successful `:connect` | `teardown_local` skips (the tunnel must survive the local server being detached) |
 | a newer flow takes over (stale) | the superseded verification loop bows out silently |
 
 The plugin is single-session: **each nvim instance holds exactly one
@@ -527,6 +537,7 @@ the handle's `alive`.
 | a save inside the attached session reports the control channel lost | the client plugin is too old / the announce was lost | follow the guidance: `:detach` → `:SshDevForward` + `:w` in a new local nvim → `:SshDevAttach` |
 | `5432 = db.internal:5432` does not connect | the target resolves **on the server**: the server cannot reach db.internal, or the local port is wrong | verify from the remote with `nc -vz db.internal 5432`; check the local side with `ss -ltn` |
 | the forwards do not come back after reconnecting | `forward_on_connect = false`, or every port was already listening (recognized as "kept leftovers") | force a replay with `:SshDevForward` + `:w`; check the setting |
+| the forwards do not come back after a network drop | the relay is still rebuilding the tunnel, or the remote server itself stopped | wait for "reconnecting…" to finish; `:SshDevLog` shows the keeper's re-apply. If the server stopped, reconnect (`forward_on_connect` replays them) |
 | the forwards vanish together with nvim | intended: `VimLeavePre` cleanup (except right after a `:connect` attach) | reconnect replays them, or save forward.txt manually |
 
 ---

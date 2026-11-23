@@ -21,6 +21,15 @@
 ---                 └─ otherwise: scp config to staging ─► headless install
 ---                      ─► mark .ready ─► start server ─► tunnel ─► attach
 ---
+--- The attach step has two shapes:
+---
+---   connect strategy + reconnect (default)  ─► local reconnect proxy
+---        scripts/ui_proxy.lua owns the ssh tunnel and the UI channel; a
+---        network drop rebuilds the tunnel and replays the UI attach instead
+---        of exiting the local nvim (see lua/sshdev/proxy.lua).
+---   anything else                           ─► plain ssh -N -L tunnel
+---        the UI attaches directly (:connect / terminal / command).
+---
 --- There is no quit hijacking: the remote server simply quits on :q and
 --- saves session.vim on the way out, so the next connection restores it.
 
@@ -32,16 +41,22 @@ local Forward = require('sshdev.forward')
 local History = require('sshdev.history')
 local Layout = require('sshdev.layout')
 local Proc = require('sshdev.proc')
+local Proxy = require('sshdev.proxy')
 local Ssh = require('sshdev.ssh')
 local Util = require('sshdev.util')
 
 local M = {}
 
 local state = {
-  info = nil, -- { dest, port, workspace, workspace_profile, workspace_profile_key, nvim_profile, nvim_profile_key, remote_root, lport, rport }
-  tunnel = nil, -- ssh tunnel handle (only when WE started it)
+  -- { dest, port, workspace, workspace_profile, workspace_profile_key,
+  --   nvim_profile, nvim_profile_key, remote_root, lport, rport, proxy }
+  info = nil,
+  tunnel = nil, -- ssh tunnel handle (only when WE started it, non-proxy attach)
+  proxy = nil, -- local reconnect proxy handle (connect strategy with reconnect)
   control = nil, -- RPC control channel to the remote server (remote pushes client-side actions)
   attached = false, -- a :connect was issued from this session
+  keeper_gen = 0, -- generation counter of the control-channel keeper
+  reconnected = false, -- at least one automatic reconnection happened
 }
 
 ---Throw a user-facing error without Lua's "file:line:" prefix.
@@ -292,9 +307,234 @@ local function close_control_channel()
   end
 end
 
+---Is the control channel still alive?
+---
+---A closed RPC channel keeps its id around for a moment and `rpcnotify` is
+---the cheapest liveness probe (it returns 0 when the channel is unusable).
+---@return boolean
+local function control_channel_alive()
+  local c = state.control
+  if not c or type(c.ch) ~= 'number' then
+    return false
+  end
+  local ok, res = pcall(vim.fn.rpcnotify, c.ch, 'nvim_exec_lua', 'return 1')
+  return ok and res ~= 0 and res ~= false
+end
+
+---Push the workspace environment and replay the persisted forwards.
+---Shared by both attach paths; `state.control` must be set.
+---@param cfg table
+---@param parsed table
+local function prepare_attached_session(cfg, parsed)
+  -- Inject the workspace environment into the server. A fresh start already
+  -- inherited it from the start script's exports; this push also covers
+  -- re-attaching to a running server and unsets variables removed from
+  -- env.txt. Skip it when env_on_connect is off and nothing was saved.
+  if cfg.env_on_connect ~= false or Env.active_for(parsed) then
+    Env.push({ control = state.control })
+  end
+
+  -- re-apply the workspace's persisted forwards (forward_on_connect):
+  -- async so it never delays the attach; its messages surface in the
+  -- attached UI through the control channel.
+  if cfg.forward_on_connect ~= false then
+    local finfo = state.info
+    Proc.launch(function()
+      require('sshdev.forward').apply_connect({
+        cfg = cfg,
+        parsed = parsed,
+        remote_root = finfo.remote_root,
+        workspace = finfo.workspace,
+        workspace_profile = finfo.workspace_profile,
+        workspace_profile_key = finfo.workspace_profile_key,
+        control = state.control,
+      })
+    end)
+  end
+end
+
+---Record the connection in the history file.
+---@param cfg table
+---@param parsed table
+---@param layout table
+local function record_history(cfg, parsed, layout)
+  History.record(cfg, {
+    dest = Util.format_dest(parsed),
+    workspace = layout.workspace,
+    workspace_profile_key = layout.workspace_profile_key,
+    nvim_profile_key = layout.nvim_profile_key,
+  })
+end
+
+---Keep the RPC control channel alive across network drops.
+---
+---While the UI is attached through the reconnect proxy, THIS nvim becomes
+---headless but keeps running (the UI detaches from its local server with
+---:connect, the server stays alive). The control channel shares the proxy's
+---ssh tunnel, so it dies with the network and must be re-opened after the
+---proxy rebuilt the tunnel; forwards and env are re-applied on the new
+---channel. Best effort: every failure is logged and retried.
+---@param cfg table
+---@param parsed table
+---@param control_port integer local control forward of the proxy tunnel
+local function start_control_keeper(cfg, parsed, control_port)
+  state.keeper_gen = state.keeper_gen + 1
+  local gen = state.keeper_gen
+  local info = state.info
+  local function tick()
+    if state.keeper_gen ~= gen or state.info ~= info or not state.info then
+      return
+    end
+    if vim.env.SSHDEV_REMOTE == '1' then
+      return
+    end
+    if not control_channel_alive() then
+      close_control_channel()
+      local ch = open_control_channel(control_port)
+      if ch then
+        state.control = ch
+        state.reconnected = true
+        Util.log('control channel restored for %s', info.dest)
+        pcall(vim.fn.rpcnotify, ch, 'nvim_echo', {
+          { ('[sshdev] reconnected to %s'):format(info.dest) },
+        }, true, {})
+        if cfg.env_on_connect ~= false or Env.active_for(parsed) then
+          Env.push({ control = ch })
+        end
+        if cfg.forward_on_connect ~= false then
+          local finfo = info
+          Proc.launch(function()
+            require('sshdev.forward').apply_connect({
+              cfg = cfg,
+              parsed = parsed,
+              remote_root = finfo.remote_root,
+              workspace = finfo.workspace,
+              workspace_profile = finfo.workspace_profile,
+              workspace_profile_key = finfo.workspace_profile_key,
+              control = state.control,
+            })
+          end)
+        end
+      end
+    end
+    vim.defer_fn(tick, 1500)
+  end
+  vim.defer_fn(tick, 1500)
+end
+
+---Attach through the local reconnect proxy (`cfg.reconnect`, connect strategy).
+---
+---The proxy owns the ssh tunnel and keeps the UI's local RPC channel open
+---across drops: it rebuilds the tunnel and replays the UI attach on the new
+---upstream, so the local nvim process never exits and the remote session is
+---untouched. This function starts the proxy, verifies the remote server
+---through its control forward, replays the session state and issues :connect.
+---@param cfg table
+---@param parsed table
+---@param layout table
+---@param rport integer remote server listen port
+local function run_attach_proxy(cfg, parsed, layout, rport)
+  if state.tunnel then
+    state.tunnel.kill()
+    state.tunnel = nil
+  end
+  if state.proxy then
+    Proxy.stop(state.proxy)
+    state.proxy = nil
+  end
+  close_control_channel()
+
+  Util.status('opening the reconnect proxy ...')
+  local handle, perr = Proxy.start(cfg, parsed, rport, {
+    key = layout.workspace_profile_key,
+  })
+  if not handle then
+    fail(perr)
+  end
+  state.proxy = handle
+  state.info = {
+    dest = Util.format_dest(parsed),
+    port = parsed.port,
+    workspace = layout.workspace,
+    workspace_profile = layout.workspace_profile,
+    workspace_profile_key = layout.workspace_profile_key,
+    nvim_profile = layout.nvim_profile,
+    nvim_profile_key = layout.nvim_profile_key,
+    remote_root = layout.root,
+    lport = handle.ports.listen,
+    rport = rport,
+    control_port = handle.ports.control,
+    proxy = handle,
+  }
+
+  -- The proxy's tunnel comes up before :connect; prove that the remote
+  -- server actually answers through it (a bare TCP accept is not enough:
+  -- ssh accepts the local port before the remote target is known).
+  local uv = vim.uv or vim.loop
+  local deadline = uv.now() + cfg.timeouts.attach * 1000
+  local control = nil
+  local attempt = 0
+  while uv.now() < deadline do
+    attempt = attempt + 1
+    if not Proxy.alive(handle) then
+      local tail = Proxy.log_tail(handle)
+      Proxy.stop(handle)
+      state.proxy = nil
+      state.info = nil
+      fail(('the reconnect proxy died before the remote server answered:\n%s'):format(tail))
+    end
+    control = open_control_channel(handle.ports.control)
+    if control then
+      break
+    end
+    Util.log('remote server not answering through the proxy yet (attempt %d)', attempt)
+    Proc.sleep(300)
+  end
+  if not control then
+    local tail = Proxy.log_tail(handle)
+    Proxy.stop(handle)
+    state.proxy = nil
+    state.info = nil
+    fail(('the remote nvim server did not answer through the reconnect proxy '
+      .. 'at 127.0.0.1:%d after %ds.\n%s/server.log on the remote and '
+      .. ':SshDevLog may help.\n%s'):format(
+      handle.ports.listen,
+      cfg.timeouts.attach,
+      layout.workspace_profile,
+      tail
+    ))
+  end
+  state.control = control
+  Util.log(
+    'tunnel up through the reconnect proxy: 127.0.0.1:%d -> %s:127.0.0.1:%d',
+    handle.ports.listen,
+    parsed.dest,
+    rport
+  )
+
+  prepare_attached_session(cfg, parsed)
+
+  Util.status('attaching to the remote server ...')
+  local ok, aerr = pcall(attach_ui, cfg, ('127.0.0.1:%d'):format(handle.ports.listen))
+  if not ok then
+    Proxy.stop(handle)
+    state.proxy = nil
+    state.info = nil
+    close_control_channel()
+    fail(aerr)
+  end
+  start_control_keeper(cfg, parsed, handle.ports.control)
+  record_history(cfg, parsed, layout)
+end
+
 ---Open the tunnel (or reuse an existing one) and attach.
 ---Must run inside a flow coroutine.
 local function run_attach(cfg, parsed, layout, rport)
+  local strategy = attach_strategy(cfg.attach or 'auto', ui_kind())
+  if strategy == 'connect' and cfg.reconnect and vim.fn.exists(':connect') == 2 then
+    return run_attach_proxy(cfg, parsed, layout, rport)
+  end
+
   if state.tunnel then
     state.tunnel.kill()
     state.tunnel = nil
@@ -374,40 +614,11 @@ local function run_attach(cfg, parsed, layout, rport)
   close_control_channel()
   state.control = open_control_channel(lport)
 
-  -- Inject the workspace environment into the server. A fresh start already
-  -- inherited it from the start script's exports; this push also covers
-  -- re-attaching to a running server and unsets variables removed from
-  -- env.txt. Skip it when env_on_connect is off and nothing was saved.
-  if cfg.env_on_connect ~= false or Env.active_for(parsed) then
-    Env.push({ control = state.control })
-  end
-
-  -- re-apply the workspace's persisted forwards (forward_on_connect):
-  -- async so it never delays the attach; its messages surface in the
-  -- attached UI through the control channel.
-  if cfg.forward_on_connect ~= false then
-    local finfo = state.info
-    Proc.launch(function()
-      require('sshdev.forward').apply_connect({
-        cfg = cfg,
-        parsed = parsed,
-        remote_root = finfo.remote_root,
-        workspace = finfo.workspace,
-        workspace_profile = finfo.workspace_profile,
-        workspace_profile_key = finfo.workspace_profile_key,
-        control = state.control,
-      })
-    end)
-  end
+  prepare_attached_session(cfg, parsed)
 
   Util.status('attaching to the remote server ...')
   attach_ui(cfg, ('127.0.0.1:%d'):format(lport))
-  History.record(cfg, {
-    dest = Util.format_dest(parsed),
-    workspace = layout.workspace,
-    workspace_profile_key = layout.workspace_profile_key,
-    nvim_profile_key = layout.nvim_profile_key,
-  })
+  record_history(cfg, parsed, layout)
 end
 
 -----------------------------------------------------------------------
@@ -1082,9 +1293,14 @@ end
 function M.stop()
   Proc.launch(function()
     local cfg = Config.get()
+    state.keeper_gen = state.keeper_gen + 1
     if state.tunnel then
       state.tunnel.kill()
       state.tunnel = nil
+    end
+    if state.proxy then
+      Proxy.stop(state.proxy)
+      state.proxy = nil
     end
     close_control_channel()
     Forward.kill()
@@ -1136,7 +1352,7 @@ function M.status()
 
     if state.info then
       local info = state.info
-      local up = (state.tunnel and state.tunnel.alive) or state.attached
+      local up = (state.tunnel and state.tunnel.alive) or state.attached or Proxy.alive(state.proxy)
       lines[#lines + 1] = ('session: %s'):format(info.dest)
       lines[#lines + 1] = ('workspace: %s'):format(info.workspace)
       lines[#lines + 1] = ('workspace profile: %s'):format(info.workspace_profile)
@@ -1146,6 +1362,17 @@ function M.status()
         info.lport or -1,
         info.rport or -1
       )
+      if info.proxy then
+        lines[#lines + 1] = Proxy.status_line(info.proxy) or 'reconnect proxy: stopped'
+        lines[#lines + 1] = ('reconnect: %s'):format(
+          state.reconnected and 'used (the UI re-attached at least once)' or 'armed'
+        )
+        if state.control then
+          lines[#lines + 1] = 'control channel: up'
+        else
+          lines[#lines + 1] = 'control channel: down (re-opening when the link returns)'
+        end
+      end
       local parsed = Util.parse_dest(info.dest)
       if parsed then
         parsed.port = info.port
@@ -1284,15 +1511,21 @@ function M.pick_history(opts)
 end
 
 ---Kill the local tunnel handle (VimLeavePre), except right after a
----successful :connect where the local server may stop itself. The user
----forwards and the control channel share the tunnel's lifecycle.
+---successful :connect, where the local server is detached and keeps running
+---(headless). The user forwards, the reconnect proxy and the control channel
+---share the session's lifecycle.
 function M.teardown_local()
   if state.attached then
     return
   end
+  state.keeper_gen = state.keeper_gen + 1
   if state.tunnel then
     state.tunnel.kill()
     state.tunnel = nil
+  end
+  if state.proxy then
+    Proxy.stop(state.proxy)
+    state.proxy = nil
   end
   close_control_channel()
   Forward.kill()
@@ -1304,6 +1537,8 @@ function M.state()
   return {
     info = state.info and vim.deepcopy(state.info) or nil,
     tunnel_alive = state.tunnel and state.tunnel.alive or false,
+    proxy_alive = state.proxy ~= nil and Proxy.alive(state.proxy),
+    reconnected = state.reconnected,
     forward = Forward.applied(),
   }
 end

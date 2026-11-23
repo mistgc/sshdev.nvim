@@ -245,6 +245,43 @@ detaches first, the attach fails, and the process ends -- which makes
 	"command"   do not attach; just report the command to run
 
 ==============================================================================
+RECONNECTING					*sshdev-reconnect*
+
+A direct |:connect| channel is the UI client's *server* channel: when the SSH
+tunnel dies (network flap, VPN reconnect, laptop suspend), the UI client gets
+EOF and nvim exits the whole local process. `reconnect` (default on) avoids
+that by attaching through a small local relay instead of directly into the
+tunnel: >
+
+	local UI  --:connect-->  127.0.0.1:<port>   [reconnect proxy]
+	                            |  owns: ssh -N -L <ui> -L <control>
+	                            v
+	                     remote nvim --headless --listen
+
+The UI client's channel is the relay's local socket and never closes. When
+the tunnel dies the relay rebuilds it (same local ports, retried with backoff
+while the network is down), reconnects to the remote server and replays the
+UI attach there. The remote server sees a new UI attach and sends a full
+screen; the local UI just gets a normal redraw. The remote server and its
+session are untouched, so the next screen is exactly where you left off.
+
+The local nvim server is detached by |:connect| and keeps running headless;
+it re-opens the RPC control channel after the reconnect and re-applies
+forward.txt / env.txt (|sshdev-forwards|, |sshdev-env|).
+
+Limits:
+- detection waits for ssh itself: up to ServerAliveInterval *
+  ServerAliveCountMax (45 s with the built-in options), usually instant when
+  the TCP connection is reset. The terminal title shows
+  "sshdev: reconnecting to …" meanwhile; keys typed while frozen are
+  discarded, not replayed.
+- a reconnect only re-establishes the LINK. If the remote server stopped
+  (|:q|, :SshDevStop, host reboot) the local UI exits as before; reconnect
+  later with :SshDevConnect.
+- the `terminal` attach strategy has its own UI client and is not supervised.
+- `reconnect = false` restores the plain |:connect| behaviour.
+
+==============================================================================
 PORT FORWARDS						*sshdev-forwards*
 
 `:SshDevForward` manages custom ssh port forwards for a workspace. The
@@ -524,6 +561,7 @@ Setup with defaults (all keys optional): >
 	  install_commands = { 'Lazy! restore' },
 	  excludes = { '.git', '.github' },
 	  attach = 'auto',             -- "auto" | "terminal" | "connect" | "command"
+	  reconnect = true,            -- survive network drops (local relay)
 	  history = true,              -- remember connections for the picker
 	  history_limit = 50,
 	  timeouts = { ssh = 60, download = 600, install = 900, attach = 30, lock = 120 },
@@ -589,6 +627,15 @@ env_on_connect ~
 attach ~
 	See |sshdev-attach|.
 
+reconnect ~
+	Default true: the `connect` attach strategy runs through a local
+	reconnect proxy that keeps the UI alive when the SSH/network link
+	drops, rebuilds the tunnel and replays the UI attach; the remote
+	session continues without a restart. The control channel and
+	forward.txt are re-applied after the reconnect (see
+	|sshdev-reconnect|). Set false to attach directly (a dropped
+	channel then exits the local nvim, which is nvim's own behaviour).
+
 auth ~
 	"auto" (default): keys / ssh-agent first, non-interactive. When
 		the server rejects that, ask for a password once
@@ -627,6 +674,10 @@ the remote server log is `<workspace-profile>/server.log`.
   helper is writable under stdpath("cache").
 - Slow FIRST connect -- the nvim release and all plugins are downloaded
   once per remote + config content. Subsequent workspaces reuse the profile.
+- The network dropped and the screen froze -- the reconnect proxy is
+  rebuilding the tunnel (terminal title: "reconnecting…"); the session on the
+  remote host is untouched. If the remote server itself stopped the local UI
+  exits instead. See |sshdev-reconnect| and `:SshDevLog`.
 - Plugins reinstall unexpectedly -- your config content changed (or the nvim
   version, or `excludes`). The nvim profile key tells you which content it
   belongs to; `:SshDevProfiles` lists them.

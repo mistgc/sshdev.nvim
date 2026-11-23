@@ -65,6 +65,11 @@ The state on the remote host is split into two independent levels:
 6. **Forwards workspace services** (`:SshDevForward`) and **injects workspace
    environment variables** (`:SshDevEnv`): both files live in the remote
    workspace profile, are edited locally, and are re-applied on reconnect.
+7. **Survives network drops** (`reconnect = true`, the default): a local
+   relay owns the ssh tunnel and keeps the UI channel open, so a Wi‑Fi flap
+   does not close your editor — the tunnel is rebuilt and the remote session
+   continues where it was. See
+   [Surviving network drops](#surviving-network-drops-the-local-reconnect-proxy).
 
 MIT licensed.
 
@@ -259,16 +264,17 @@ current set, e.g.
 `forwards: up (3080 -> 127.0.0.1:3080, 5432 -> db.internal:5432)`.
 
 The forward tunnel is stopped by `:SshDevStop` and when the local nvim exits
-— except when the UI attached via `:connect` (the local nvim server stops as
-the UI attaches, and the detached tunnel must survive). With
+— except after the UI attached via `:connect` (the local nvim server goes
+headless and the detached tunnel must survive). With
 `forward_on_connect = true` (default) every `:SshDevConnect` / `:SshDevAttach`
 re-reads forward.txt and re-applies the forwards automatically; when every
 port is already listening, the set is assumed to be leftovers from the
 previous session and kept (force a clean re-apply with `:SshDevForward` +
-`:w`). The forwards are ordinary client-side ssh processes, independent of
-the nvim server, so the file can also be reopened and re-applied while the
-remote server is not running (pass `[dest] [workspace]` when no session is
-active).
+`:w`). With the default `reconnect = true`, a network drop is followed by an
+automatic re-apply once the reconnect proxy rebuilt the tunnel. The forwards
+are ordinary client-side ssh processes, independent of the nvim server, so
+the file can also be reopened and re-applied while the remote server is not
+running (pass `[dest] [workspace]` when no session is active).
 
 **Inside the attached session** (`:SshDevConnect` with the default
 `attach = "auto"`) the same command just works: the typed command runs in the
@@ -288,6 +294,7 @@ Common failures:
 | `the forwards … did not answer within 30s` | very slow link: the tunnel is not dead; check `:SshDevStatus` |
 | `5432 = db.internal:5432` does not connect | the target is resolved **on the server** — verify it there with `nc -vz db.internal 5432`; check the local listener on port 5432 |
 | forwards did not come back after reconnecting | `forward_on_connect = false`, or every port was already listening (kept as leftovers); force a save |
+| the forwards did not come back after a network drop | wait for the reconnect proxy (terminal title shows "reconnecting…"); the control keeper re-applies them once the tunnel is back. If the remote server itself stopped they will not come back |
 
 Full implementation notes: [docs/port-forwarding.md](docs/port-forwarding.md).
 
@@ -511,6 +518,49 @@ back after quitting the remote one).
 
 Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
 
+### Surviving network drops: the local reconnect proxy
+
+`:connect` hands the UI client's *server channel* to the remote host. If that
+channel dies (Wi‑Fi flap, VPN reconnect, laptop suspend), nvim's UI client
+sees EOF and exits — and the local nvim process exits with it. That is exactly
+the "the editor randomly closed" failure.
+
+`reconnect = true` (the default) prevents it. The attach goes through a tiny
+local relay instead of directly into the ssh tunnel:
+
+```text
+local nvim (UI client) ──:connect──> 127.0.0.1:<port>
+                                          │  reconnect proxy (headless nvim)
+                                          │  owns: ssh -N -L <ui> -L <control>
+                                          ▼
+                                   remote nvim --headless --listen
+```
+
+The UI client's channel is the local relay socket, which never closes. When
+the ssh link drops, the relay:
+
+1. notices the dead tunnel and rebuilds it (same local ports, retried with
+   backoff while the network is down),
+2. reconnects to the remote server and replays the UI attach there, so the
+   server sends a fresh full screen,
+3. keeps the terminal UI on its original channel — no exit, no local restart,
+4. meanwhile, the local nvim server (now headless) re-opens the RPC control
+   channel and re-applies `forward.txt` / `env.txt`.
+
+What you see: the screen freezes for as long as ssh needs to notice the dead
+link (up to `ServerAliveInterval × ServerAliveCountMax` = 45 s with the
+built-in ssh options; usually instantly on a reset connection). The terminal
+title changes to `sshdev: reconnecting to …` while the proxy works. When the
+link is back, the remote session continues exactly where it was — the remote
+server never stopped. Keys typed while frozen are discarded, not replayed
+after the reconnect.
+
+What it does *not* do: if the remote server itself stops (`:q` in the remote
+session, `:SshDevStop`, remote reboot), the local UI exits as before — there
+is nothing to reconnect to. A failed *initial* connection also fails
+normally. `reconnect = false` restores the direct `:connect` behaviour;
+`attach = 'terminal'` is not supervised and keeps its own UI client.
+
 ## Password authentication
 
 The default `auth = 'auto'` tries key/ssh-agent first, fully
@@ -618,6 +668,7 @@ require('sshdev').setup({
   excludes = { '.git', '.github' },
 
   attach = 'auto',           -- "auto" | "terminal" | "connect" | "command"
+  reconnect = true,          -- survive network drops (local reconnect proxy)
   history = true,            -- remember connections for the picker
   history_limit = 50,
 
@@ -637,6 +688,13 @@ Notes:
   content hash: changing them creates a new nvim profile (a one-time install).
 - `nvim_profile` is normally `'auto'`; pin a key to reuse a specific existing
   profile for a new workspace.
+- `reconnect` (default `true`) keeps the local UI alive across SSH/network
+  drops: the `connect` attach runs through a local relay that rebuilds the
+  tunnel and re-attaches the same UI channel, so a Wi‑Fi flap does not close
+  your editor. The remote nvim server is never restarted; the session simply
+  continues. Set `false` to attach directly (then a dropped channel exits the
+  local nvim, as nvim does by itself). See
+  [Surviving network drops](#surviving-network-drops-the-local-reconnect-proxy).
 - `forward_on_connect` / `env_on_connect` (both default `true`) replay
   `forward.txt` / `env.txt` after every connect/attach; disable them to apply
   only explicit saves in the current nvim session.
@@ -665,6 +723,18 @@ Yes — since Nvim 0.12 the builtin UI is a UI client process and implements the
 `connect` UI event, so `:connect host:port` re-attaches the terminal UI in
 place. (It only looks broken if you pass a scheme like `tcp://host:port`:
 that is not a valid nvim server address and leaves the UI detached.)
+
+**Why did my nvim close when the network blipped?**
+Because a direct `:connect` channel is the UI client's server channel: nvim
+exits its UI client when that RPC channel closes. `reconnect = true` (the
+default) avoids it by attaching through a local relay; set it to `false` only
+if you really want the raw `:connect` behaviour. See
+[Surviving network drops](#surviving-network-drops-the-local-reconnect-proxy).
+
+**What if the remote server quits or the host reboots?**
+Auto-reconnect only rebuilds the *link* to a server that is still running. If
+the server itself stopped (`:q`, `:SshDevStop`, reboot), the local UI exits as
+before; `:SshDevConnect` starts a new server and restores `session.vim`.
 
 **When would I use `attach = 'terminal'`?**
 When you want to keep your local nvim alive while working remotely: it opens a

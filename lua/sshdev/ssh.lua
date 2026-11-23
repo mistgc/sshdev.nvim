@@ -263,6 +263,52 @@ local function spawn_detached_tunnel(cfg, parsed, args, meta)
   return t
 end
 
+---argv for the session tunnel: `ssh -N -L 127.0.0.1:lport -> 127.0.0.1:rport`,
+---plus optional extra forwards (the reconnect proxy adds a second `-L` for
+---the client control channel). Pure (spawns nothing), so the argument
+---construction is unit-testable.
+---@param cfg table
+---@param parsed table
+---@param lport integer
+---@param rport integer
+---@param extra table[]|nil additional forwards { lport, rport }
+---@return string[] args
+function M.tunnel_args(cfg, parsed, lport, rport, extra)
+  local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
+  vim.list_extend(args, {
+    '-N',
+    '-L',
+    ('127.0.0.1:%d:127.0.0.1:%d'):format(lport, rport),
+  })
+  for _, f in ipairs(extra or {}) do
+    vim.list_extend(args, {
+      '-L',
+      ('127.0.0.1:%d:127.0.0.1:%d'):format(f[1], f[2]),
+    })
+  end
+  vim.list_extend(args, {
+    '-o',
+    'ControlMaster=no',
+    '-o',
+    'ExitOnForwardFailure=yes',
+    '--',
+    parsed.dest,
+  })
+  return args
+end
+
+---argv for the reconnect proxy's tunnel: the UI stream forward plus the
+---control-channel forward, both on loopback.
+---@param cfg table
+---@param parsed table
+---@param lport integer UI stream forward
+---@param cport integer control-channel forward
+---@param rport integer remote listen port
+---@return string[] args
+function M.proxy_tunnel_args(cfg, parsed, lport, cport, rport)
+  return M.tunnel_args(cfg, parsed, lport, rport, { { cport, rport } })
+end
+
 ---Start the local forward `ssh -N -L 127.0.0.1:lport -> 127.0.0.1:rport`.
 ---
 ---Returns a handle table { job, alive, kill(), dest, lport, rport }.
@@ -272,18 +318,7 @@ end
 ---@param rport integer
 ---@return table
 function M.start_tunnel(cfg, parsed, lport, rport)
-  local args = base_args(cfg, parsed, cfg.ssh_bin, 'ssh')
-  vim.list_extend(args, {
-    '-N',
-    '-L',
-    ('127.0.0.1:%d:127.0.0.1:%d'):format(lport, rport),
-    '-o',
-    'ControlMaster=no',
-    '-o',
-    'ExitOnForwardFailure=yes',
-    '--',
-    parsed.dest,
-  })
+  local args = M.tunnel_args(cfg, parsed, lport, rport)
   return spawn_detached_tunnel(cfg, parsed, args, {
     dest = parsed.dest,
     lport = lport,

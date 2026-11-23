@@ -27,6 +27,14 @@ ssh -N -L 127.0.0.1:<lport> → <dest> → 127.0.0.1:<rport>   ← detached tunn
 remote nvim --headless --listen 127.0.0.1:<rport>          ← server running in the workspace
 ```
 
+With `reconnect = true` (the default) the UI does not attach to the tunnel
+directly: a small local relay (`scripts/ui_proxy.lua`) owns the tunnel and
+keeps the UI's RPC channel open across network drops (§ 8.6):
+
+```text
+UI client --:connect--> 127.0.0.1:<lport>  [relay]  <-- ssh -L ui + control --> remote
+```
+
 Key design decisions:
 
 | Decision | Rationale |
@@ -37,6 +45,7 @@ Key design decisions:
 | The local config is uploaded wholesale into a **content-addressed** profile | The remote session behaves exactly like home; workspaces with the same config content share the profile and plugins are installed once |
 | Every remote operation is `ssh -- dest sh -s` with the script on stdin | No client-side remote command line is ever assembled, eliminating the shell-quoting injection surface entirely |
 | No `:q` hijacking | The server quits normally, writes `session.vim` on `VimLeavePre`, and the next connection restores it |
+| The UI attaches through a local relay (`reconnect = true`) | A dropped RPC channel makes nvim's UI client exit (§ 8.6); the relay keeps the channel open and rebuilds the tunnel instead |
 
 ---
 
@@ -152,10 +161,15 @@ flowchart TD
     I --> K["Bootstrap.start_server<br/>(tries rbase..rbase+2)"]
     J --> K
     K --> T
-    T --> TUN["create / reuse the tunnel → wait for RPC"]
-    TUN --> CTRL["open the RPC control channel<br/>(forward_on_connect replays forwards async)"]
+    T --> TUN{"reconnect enabled?"}
+    TUN -->|"yes (connect strategy)"| PXY["Proxy.start: local relay +<br/>its own ssh tunnel (-L ui, -L control)"]
+    PXY --> CTRL
+    TUN -->|"no / terminal / command"| TNL["create / reuse the tunnel → wait for RPC"]
+    TNL --> CTRL
+    CTRL["open the RPC control channel<br/>(forward_on_connect replays forwards async)"]
     CTRL --> ATT["attach_ui: :connect / terminal / command"]
-    ATT --> HIST([record history, done])
+    ATT --> KEEP["start_control_keeper<br/>(reconnect path only)"]
+    KEEP --> HIST([record history, done])
 ```
 
 Step by step (source: `lua/sshdev/session.lua`):
@@ -203,9 +217,13 @@ Step by step (source: `lua/sshdev/session.lua`):
    installed twice in parallel.
 9. **start_server** — tries `rbase`, `rbase+1`, `rbase+2` in order
    (§7.2); only when all three fail is an error reported.
-10. **run_attach** — create/reuse the tunnel, wait for RPC reachability
-    (§7.3), open the control channel (§8.4), asynchronously replay the
-    `forward.txt` forwards, attach the UI, record history.
+10. **run_attach** — with `reconnect = true` and the `connect` strategy,
+    start the local relay (§8.6), verify the server through its control
+    forward, open the control channel (§8.4), asynchronously replay the
+    `forward.txt` forwards, attach the UI and start the control keeper;
+    otherwise create/reuse the plain tunnel, wait for RPC reachability
+    (§7.3), open the control channel, replay the forwards, attach the UI.
+    Either way the connection is recorded in history.
 
 How the commands map onto the pipeline:
 
@@ -426,6 +444,12 @@ back into `server.pid`, i.e. they *adopt* a running server).
   attempts), starts a new tunnel, and polls for RPC reachability within
   `timeouts.attach` (default 30s). A tunnel that dies mid-flight fails
   immediately with ssh's own stderr tail attached.
+- With `reconnect = true` (`connect` strategy) this section is owned by the
+  relay instead: the relay picks a block of four adjacent ports from the
+  same `lbase` (UI, tunnel, control, admin), probes them for collisions, and
+  writes a `proxy-<token>.ready` marker once its listener is bound. The
+  plugin then waits for the *control* forward and validates the server with a
+  real RPC handshake before issuing `:connect`. § 8.6 has the state machine.
 
 ### 7.4 Session persistence
 
@@ -478,6 +502,11 @@ Configuration: `session = false` disables saving entirely;
 quitting the remote session), or `'command'` (do not attach; print the
 command).
 
+With `attach = 'auto'`/`'connect'` and `reconnect = true` (the default), the
+`connect` attach goes through the local reconnect relay described in § 8.6;
+the target address passed to `:connect` is still a bare `127.0.0.1:<lport>`
+(on the relay), so none of the attachment semantics change.
+
 ### 8.2 The `:connect` address-format trap
 
 `:connect` accepts only a **bare `host:port`** (or the builtin
@@ -528,16 +557,81 @@ guidance.
 `plugin/sshdev.lua` registers `VimLeavePre` →
 `Session.teardown_local()`:
 
-- skipped right after a successful `:connect` (`state.attached`) — the
-  local nvim process stops its own server as it attaches, and the tunnel
-  must survive that moment (the remote server keeps running, which is
+- skipped right after a successful `:connect` (`state.attached`) — the local
+  nvim server is detached from the UI client by `:connect` and must keep
+  running (the remote session and the reconnect relay depend on it), and the
+  tunnel must survive that moment (the remote server keeps running, which is
   the point);
-- otherwise the session tunnel it started is killed, the control
-  channel closed, and the user forwards stopped (`Forward.kill()`).
+- otherwise the session tunnel it started is killed, the reconnect proxy
+  stopped (gracefully, through its admin port), the control channel closed,
+  and the user forwards stopped (`Forward.kill()`).
 
-`:SshDevStop` is the explicit form: kill the tunnel, close the control
-channel, stop the forwards, `SIGTERM` the remote server (which saves the
-session via `VimLeavePre`), and clear the local session state.
+`:SshDevStop` is the explicit form: kill the tunnel, stop the proxy, close the
+control channel, stop the forwards, `SIGTERM` the remote server (which saves
+the session via `VimLeavePre`), and clear the local session state.
+
+### 8.6 The reconnect proxy (`reconnect = true`)
+
+**Why.** `:connect` hands the UI client's *server channel* to the remote
+server. nvim's UI client treats EOF on that channel as "the server exited"
+and calls `exit_on_closed_chan()`: the local nvim process exits. A Wi-Fi
+flap, a VPN reconnect or a laptop suspend therefore looks exactly like a
+crash.
+
+**Shape.** With `reconnect` enabled the UI attaches to a local relay instead
+of to the ssh tunnel:
+
+```text
+UI client --:connect--> 127.0.0.1:<lport>
+                            │  scripts/ui_proxy.lua (detached headless nvim)
+                            │    ssh -N -L <tunnel>:rport -L <control>:rport
+                            ▼
+                     remote nvim --headless --listen 127.0.0.1:<rport>
+```
+
+The relay owns the ssh tunnel and the UI's channel is the relay's listening
+socket, which never closes. It is a transparent msgpack-RPC relay: bytes from
+the UI are forwarded upstream and vice versa. Two things are not transparent:
+
+1. `nvim_ui_attach` (and `nvim_set_client_info`) are **captured** from the UI
+   stream and replayed on every new upstream connection. The remote server
+   sees a fresh UI attach and sends a full screen; the local UI just receives
+   a normal redraw on its unchanged channel.
+2. `nvim_input`/`nvim_paste` are dropped while the upstream is down, so a
+   key typed against a frozen screen cannot execute minutes later.
+
+**State machine.**
+
+| Event | Action |
+| --- | --- |
+| startup | bind `lport` (write the plugin's readiness marker), spawn the ssh tunnel, connect the upstream forward |
+| upstream EOF, ssh process still alive | the remote server closed the UI channel (`:q`, `:detach`, crash): close the UI channel so the local UI exits; stop the tunnel |
+| upstream EOF, ssh process died | network drop: keep the UI channel open, retry the tunnel/upstream with exponential backoff (1 s → 30 s), resend the captured attach once connected |
+| tunnel bind failure on the first attempt | the plugin's port guess collided: exit so the plugin retries with a different port block |
+| ssh auth failure | cannot prompt from the relay: exit, the local UI exits; the next connect asks again |
+| UI channel EOF | the local UI went away: stop the tunnel and exit, reaping the detached local nvim server (`parent_pid`) so no headless orphan is left |
+| admin port connection | the plugin is tearing the relay down on purpose: stop the tunnel and exit without reaping the parent |
+
+**Companions.** The relay's tunnel also forwards the RPC control channel
+(§ 8.4) on a second local port. The local nvim server — headless after
+`:connect` but still alive — runs a small keeper that notices the dead control
+channel, re-opens it when the relay's tunnel is back, re-pushes `env.txt` and
+re-applies `forward.txt`, then echoes `[sshdev] reconnected to …` into the
+attached remote UI. The reader is § 8.4; the keeper lives in
+`session.lua:start_control_keeper`.
+
+**Limits.** Detection is bounded by ssh's own keepalives
+(`ServerAliveInterval=15`, `ServerAliveCountMax=3` → up to 45 s); a reset
+connection is detected immediately. Only the link is rebuilt: if the remote
+server itself stopped, the local UI exits (there is nothing to reconnect to).
+The `terminal` strategy has its own UI client and is not supervised.
+`reconnect = false` restores the direct `:connect` behaviour.
+
+**Local artifacts.** One `proxy-<token>.log` and, during startup, a
+`proxy-<token>.ready` marker under `stdpath('cache')/sshdev/`; the log is
+reported when the relay cannot start. Ports come from
+`Util.local_port(dest, workspace_key)` and are probed for collisions; a
+successful start logs the four ports (UI, tunnel, control, admin).
 
 ---
 
@@ -594,6 +688,7 @@ the port-forwarding document).
 | `excludes` | `{ '.git', '.github' }` | upload-exclude globs; part of the content hash |
 | `session` / `restore_session` | `true` / `true` | session save / restore switches |
 | `attach` | `'auto'` | attach strategy (§8.1) |
+| `reconnect` | `true` | keep the UI alive across network drops through the local relay (§8.6); `false` = direct `:connect` |
 | `history` / `history_limit` | `true` / `50` | connection history and its cap |
 | `timeouts.*` | `60` etc. | ssh 60 / download 600 / install 900 / attach 30 / lock 120 (seconds) |
 
@@ -614,6 +709,9 @@ the port-forwarding document).
 | server start reports `SSHDEV:SERVER=dead` | workspace path missing/unwritable, port busy | check `<workspace-profile>/server.log` (the error carries the path) and `:SshDevLog` |
 | tunnel is up but RPC never answers | remote `AllowTcpForwarding no`, firewall | make sure sshd allows TCP forwarding |
 | the process ends right after `:connect` | the address was written `tcp://host:port` | use a bare `host:port` (§8.2) |
+| nvim exits when the network blips | `reconnect = false`, or the channel was attached outside the relay | leave `reconnect` enabled (§8.6); a direct `:connect` channel exits the UI client on EOF by design |
+| the screen is frozen after the network came back | the relay is rebuilding the tunnel; the title says "reconnecting…" | wait (ssh may take up to 45 s to notice a dead link); `:SshDevLog` + `stdpath('cache')/sshdev/proxy-*.log` show the attempts |
+| the local nvim exited during a drop | the remote server itself stopped (or auth failed) — the relay only rebuilds the link | reconnect normally with `:SshDevConnect`; the session is restored from `session.vim` |
 | the second workspace connects suspiciously fast | normal: the nvim profile is reused by content hash | confirm via `:SshDevLog` that no install phase ran |
 
 General tools: `:SshDevLog` (in-memory mirror + buffer), `:SshDevStatus`,
@@ -627,7 +725,10 @@ the remote `<workspace-profile>/server.log`, `:checkhealth sshdev`.
 | --- | --- |
 | `lua/sshdev/init.lua` | public Lua API; lazy telescope extension registration |
 | `lua/sshdev/config.lua` | defaults, merging, validation |
-| `lua/sshdev/session.lua` | connect pipeline orchestration, attach strategies, control channel, teardown |
+| `lua/sshdev/session.lua` | connect pipeline orchestration, attach strategies, reconnect proxy attach path, control channel + keeper, teardown |
+| `lua/sshdev/proxy.lua` | starts/stops the local reconnect relay, picks its ports, waits for readiness |
+| `lua/sshdev/proxy_proto.lua` | pure msgpack framing + UI-event helpers used by the relay |
+| `scripts/ui_proxy.lua` | the standalone reconnect relay (transparent RPC relay + ssh tunnel owner) |
 | `lua/sshdev/layout.lua` | two-level profile path derivation (pure functions) |
 | `lua/sshdev/keys.lua` | profile key generation and validation |
 | `lua/sshdev/bootstrap.lua` | client-side remote orchestration: probe / ensure / prepare / commit / start / stop / status / listings |
