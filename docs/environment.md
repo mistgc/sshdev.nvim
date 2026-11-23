@@ -98,6 +98,13 @@ by the remote shell. The prefix is prepended **before** a template's own
 `set -eu` and `export XDG_*/SSHDEV_*` lines, so sshdev's internal variables
 always win (the parser also rejects the reserved keys).
 
+`PATH` is special: `remote_path_prepend` (see
+[remote-connection.md](remote-connection.md) §7.1) is applied **after** the
+environment exports, so an `env.txt` `PATH=...` is the base and the
+configured tool directories are prepended on top of it — the final value is
+`<remote_path_prepend dirs>:<env.txt PATH>`. Set
+`remote_path_prepend = {}` to keep exactly the env.txt value.
+
 `Env.spawn_overlay(parsed)` returns a copy of the same map for a local
 ssh/scp child; `Ssh` merges it with `Auth.env()` and **auth keys win**, so the
 askpass mechanism cannot be overridden.
@@ -250,8 +257,8 @@ config upload or plugin reinstall.
 | Module | Responsibility |
 | --- | --- |
 | `lua/sshdev/env.lua` | parse/template/local mirror, active map, open/apply/apply_remote/open_remote, runtime chunk, remote-mode assertion |
-| `lua/sshdev/ssh.lua` | script prefix, local ssh/scp env overlay, remote `chmod` |
-| `lua/sshdev/remote_scripts.lua` | `env_fetch`, `env_prepare`, `env_chmod`, `start` key manifest |
+| `lua/sshdev/ssh.lua` | script prologue (env.txt exports + PATH augmentation), local ssh/scp env overlay, remote `chmod`, runtime PATH push |
+| `lua/sshdev/remote_scripts.lua` | `env_fetch`, `env_prepare`, `env_chmod`, `start` key manifest, PATH augmentation fragment |
 | `lua/sshdev/bootstrap.lua` | renders `ENV_KEYS` into the start script |
 | `lua/sshdev/session.lua` | `load_env`, `:SshDevEnv` flow, remote-triggered apply, attach-time push |
 | `lua/sshdev/layout.lua` | `<workspace-profile>/env.txt` path |

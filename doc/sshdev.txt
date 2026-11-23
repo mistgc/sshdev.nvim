@@ -391,6 +391,51 @@ unavailable the file still applies to the server; the client mirror
 refreshes on the next :SshDevConnect.
 
 ==============================================================================
+REMOTE TOOL PATH					*sshdev-path*
+
+sshdev starts the remote nvim (and runs every remote script) through a
+NON-interactive, non-login shell: `ssh <dest> sh -s`. That shell does not
+read ~/.bashrc / ~/.profile, so its PATH is the sshd default. Tools
+installed into per-user directories are therefore invisible to the remote
+session even when they are on the PATH of an interactive login -- most
+visibly ~/.cargo/bin, where `cargo install tree-sitter-cli` puts the CLI.
+nvim-treesitter then reports >
+
+	Error during "tree-sitter build":
+	vim/_core/system:324: ENOENT: no such file or directory (cmd): 'tree-sitter'
+<
+even though the install succeeded. LSP servers / formatters in
+~/.local/bin are hidden by the same difference.
+
+`remote_path_prepend` (default
+{ '~/.cargo/bin', '~/.local/bin', '~/bin' }) fixes this. The directories
+are prepended to PATH in:
+
+	* every remote script (nvim download, headless plugin install,
+	  server start and the small control scripts);
+	* the remote nvim server itself, BEFORE your config loads -- so
+	  LSPs, :terminal, jobstart children and nvim-treesitter's
+	  `tree-sitter build` inherit the PATH;
+	* a RUNNING server, through the RPC control channel on the next
+	  :SshDevConnect / :SshDevAttach (vim.env.PATH is updated). Children
+	  started afterwards see it; an LSP that is already running keeps
+	  its old environment and needs a restart, like every runtime env
+	  push.
+
+Rules: an entry may be "~", "~/..." or an absolute path; only directories
+that exist are added, in list order, once each (a directory already on
+PATH is not duplicated); an empty list disables the augmentation and
+leaves ssh's PATH untouched. The option is NOT part of the config content
+hash, so changing it never triggers a config upload or a plugin reinstall.
+
+A `PATH=` line in the workspace env.txt (|sshdev-env|) still applies: it
+is exported first and `remote_path_prepend` is prepended on top of it.
+
+The remote PATH after `remote_path_prepend` (an env.txt `PATH=` is applied
+on top of it) is logged on every connect (`:SshDevLog`, "remote PATH:
+..."), and :checkhealth sshdev reports the configured list.
+
+==============================================================================
 PASSWORD AUTHENTICATION					*sshdev-auth*
 
 `auth = "auto"` (the default) tries key/ssh-agent first, fully
@@ -523,6 +568,7 @@ Setup with defaults (all keys optional): >
 	  download_mirror = 'https://github.com/neovim/neovim/releases/download',
 	  install_commands = { 'Lazy! restore' },
 	  excludes = { '.git', '.github' },
+	  remote_path_prepend = { '~/.cargo/bin', '~/.local/bin', '~/bin' },
 	  attach = 'auto',             -- "auto" | "terminal" | "connect" | "command"
 	  history = true,              -- remember connections for the picker
 	  history_limit = 50,
@@ -564,6 +610,15 @@ install_commands ~
 excludes ~
 	Globs matched against paths relative to your config root. They are
 	part of the config content hash.
+
+remote_path_prepend ~
+	Directories prepended to PATH ON THE REMOTE HOST, for the nvim server
+	and every remote script sshdev runs. ssh starts a non-interactive,
+	non-login shell, which does not read ~/.bashrc / ~/.profile, so tools
+	in per-user directories (cargo, pipx, ...) are otherwise invisible to
+	the remote session. Entries may be "~", "~/..." or absolute paths;
+	only directories that exist are added, in list order, once each. Set
+	{} to keep ssh's PATH untouched. See |sshdev-path|.
 
 session / restore_session ~
 	See |sshdev-session|.
@@ -661,6 +716,19 @@ the remote server log is `<workspace-profile>/server.log`.
 - A removed variable still exists after saving -- the running server was
   started before sshdev exported the key manifest; :SshDevConnect!
   restarts it with the current env.txt.
+- A remote tool is "not found" (nvim-treesitter: `ENOENT ... (cmd):
+  'tree-sitter'`, an LSP/formatter "not executable") -- the ssh shell does
+  not read your shell rc files. :SshDevLog shows the effective
+  "remote PATH:"; add the tool's directory to `remote_path_prepend`
+  (default: ~/.cargo/bin, ~/.local/bin, ~/bin) and reconnect. A running
+  server gets the new PATH over the control channel on the next connect;
+  after upgrading, a server started by the old code may need
+  :SshDevConnect!. See |sshdev-path|.
+- Parser build fails with "Failed to execute the C compiler" naming a
+  client-only compiler (e.g. "clang.exe") -- your config sets
+  `vim.env.CC`/`vim.env.CXX` unconditionally, but the uploaded config
+  runs on the remote host. Guard those assignments with
+  `vim.fn.has('win32') == 1` (or check `vim.env.SSHDEV_REMOTE == '1'`).
 - Old layout after upgrading -- see |sshdev-layout| (binaries and saved
   sessions are migrated; plugins are reinstalled once).
 

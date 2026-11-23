@@ -251,9 +251,21 @@ ssh <base args> -- user@host sh -s     ← the script is fed on stdin
   `Util.render()` substitutes `{{KEY}}` placeholders with values that
   passed `Util.shsafe()` — any value containing quotes, tabs or newlines
   throws on the client, never reaching the remote;
+- every script is prefixed by `Ssh.script_prologue()` with
+
+  1. the workspace's `env.txt` exports (`export KEY='value'`, see
+     [environment.md](environment.md)), then
+  2. the `remote_path_prepend` PATH augmentation
+     (`Scripts.path_augment`, see §7.1 and [§10](#10-connection-related-configuration-reference)).
+
+  The order is deliberate: an `env.txt` `PATH=` is the base and the
+  configured tool directories are prepended on top of it;
 - scripts report machine-readable `SSHDEV:KEY=VALUE` lines, parsed by
-  `Util.parse_keyvals()`; listings use TAB-separated rows;
-- the scripts themselves are `set -eu` POSIX sh with no bash dependency.
+  `Util.parse_keyvals()`; listings use TAB-separated rows; the probe also
+  reports the ssh shell's PATH after the `remote_path_prepend`
+  augmentation (`SSHDEV:PATH=`), logged as `remote PATH: …`;
+- the scripts themselves are `set -eu` POSIX sh with no bash dependency
+  (the prologue runs before that, so it may itself handle an unset PATH).
 
 ### 5.3 Async primitives (proc.lua)
 
@@ -367,6 +379,9 @@ and the helper status.
 executes on the remote:
 
 ```sh
+# prepended by Ssh.script_prologue() (env.txt exports, then PATH augmentation):
+# export KEY='value'                                  (env.txt)
+# for _sshdev_dir in "$HOME"/'.cargo/bin' ...; do ... (remote_path_prepend)
 cd <workspace>
 export XDG_CONFIG_HOME=<nvim-profile>
 export XDG_DATA_HOME=<nvim-profile>/xdg/share
@@ -389,6 +404,18 @@ All XDG variables are redirected into the profile: the config is exactly
 `<nvim-profile>/nvim-config` and the plugins land in
 `<nvim-profile>/xdg/share/nvim-config/` — never colliding with the remote
 user's own nvim state.
+
+**Remote PATH.** `ssh host sh -s` is a non-interactive, non-login shell: it
+does not read `~/.bashrc` / `~/.profile`, so its PATH is the sshd default.
+`cfg.remote_path_prepend` (default `~/.cargo/bin`, `~/.local/bin`, `~/bin`)
+is prepended to it before the server starts, which is what makes a
+`cargo install tree-sitter-cli` visible to nvim-treesitter, and LSPs /
+formatters in `~/.local/bin` visible to the session. `Scripts.path_augment`
+emits a POSIX fragment that adds only **existing** directories, keeps the
+configured order and skips entries already on PATH. The same prologue feeds
+the headless install run, so plugin post-install hooks see the PATH too.
+The list can be disabled with `{}` and is not part of the config content
+hash (changing it never reinstalls plugins).
 
 The start script then **verifies the port actually accepts connections**
 (up to 25 × 0.2s of polling; a dead process or a port that never listens
@@ -516,6 +543,17 @@ through the tunnel (`vim.fn.sockconnect('tcp', …, { rpc = true })`):
    the remote (the client is headless; the remote UI is the visible
    surface).
 
+The client side uses the same channel for two runtime pushes before the UI
+attaches: the workspace environment (`Env.push`, see
+[environment.md](environment.md)) and the remote PATH
+(`Ssh.push_remote_path` — a static Lua chunk that prepends the configured
+`remote_path_prepend` directories to the running server's `vim.env.PATH`;
+only directories that exist are added, deduplicated, order preserved).
+The PATH push is what heals a server started **before** the option existed
+(or before a tool directory appeared): `:TSInstall`, `:terminal` and jobs
+started afterwards see the fixed PATH without a server restart, while
+already-running LSPs keep their old environment.
+
 Current use: when `:SshDevForward` runs inside an attached session, the
 remote pushes the forward.txt save back to the client, which replaces the
 forwards bound on its own machine and reports the outcome into the remote
@@ -592,6 +630,7 @@ the port-forwarding document).
 | `download_mirror` | GitHub releases | base URL for nvim downloads |
 | `install_commands` | `{}` | extra ex-commands after the headless install (e.g. `'Lazy! restore'`) |
 | `excludes` | `{ '.git', '.github' }` | upload-exclude globs; part of the content hash |
+| `remote_path_prepend` | `{ '~/.cargo/bin', '~/.local/bin', '~/bin' }` | directories prepended to the remote PATH of the server and every remote script; only existing dirs are added, `{}` disables |
 | `session` / `restore_session` | `true` / `true` | session save / restore switches |
 | `attach` | `'auto'` | attach strategy (§8.1) |
 | `history` / `history_limit` | `true` / `50` | connection history and its cap |
@@ -615,6 +654,8 @@ the port-forwarding document).
 | tunnel is up but RPC never answers | remote `AllowTcpForwarding no`, firewall | make sure sshd allows TCP forwarding |
 | the process ends right after `:connect` | the address was written `tcp://host:port` | use a bare `host:port` (§8.2) |
 | the second workspace connects suspiciously fast | normal: the nvim profile is reused by content hash | confirm via `:SshDevLog` that no install phase ran |
+| nvim-treesitter reports `ENOENT ... (cmd): 'tree-sitter'`, or an LSP/formatter is "not executable" | `ssh host sh -s` does not read `~/.bashrc` / `~/.profile`, so the tool's directory is not on the remote PATH | add it to `remote_path_prepend`, check the `remote PATH:` line in `:SshDevLog`, reconnect (`:SshDevConnect!` for a server started before the fix) |
+| parser build fails with `Failed to execute the C compiler ... clang.exe` | the uploaded config sets a client-only `CC`/`CXX` (the same config runs on the remote host) | guard platform-specific `vim.env` assignments with `vim.fn.has('win32') == 1` (or `vim.env.SSHDEV_REMOTE == '1'`) |
 
 General tools: `:SshDevLog` (in-memory mirror + buffer), `:SshDevStatus`,
 the remote `<workspace-profile>/server.log`, `:checkhealth sshdev`.
@@ -627,12 +668,12 @@ the remote `<workspace-profile>/server.log`, `:checkhealth sshdev`.
 | --- | --- |
 | `lua/sshdev/init.lua` | public Lua API; lazy telescope extension registration |
 | `lua/sshdev/config.lua` | defaults, merging, validation |
-| `lua/sshdev/session.lua` | connect pipeline orchestration, attach strategies, control channel, teardown |
+| `lua/sshdev/session.lua` | connect pipeline orchestration, attach strategies, control channel (env/PATH pushes), teardown |
 | `lua/sshdev/layout.lua` | two-level profile path derivation (pure functions) |
 | `lua/sshdev/keys.lua` | profile key generation and validation |
 | `lua/sshdev/bootstrap.lua` | client-side remote orchestration: probe / ensure / prepare / commit / start / stop / status / listings |
-| `lua/sshdev/remote_scripts.lua` | all remote POSIX sh script templates + output parsers |
-| `lua/sshdev/ssh.lua` | ssh/scp argument construction, script execution, tunnel spawning |
+| `lua/sshdev/remote_scripts.lua` | all remote POSIX sh script templates, the PATH augmentation fragment + output parsers |
+| `lua/sshdev/ssh.lua` | ssh/scp argument construction, script prologue (env + PATH), script execution, runtime PATH push, tunnel spawning |
 | `lua/sshdev/auth.lua` | auth modes, password cache, askpass helper, failure detection |
 | `lua/sshdev/proc.lua` | coroutine async primitives, TCP probes |
 | `lua/sshdev/util.lua` | destination parsing, hashing, ports, logging, config staging |

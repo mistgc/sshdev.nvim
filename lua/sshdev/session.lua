@@ -382,6 +382,12 @@ local function run_attach(cfg, parsed, layout, rport)
     Env.push({ control = state.control })
   end
 
+  -- Same idea for the remote PATH: a server started before
+  -- remote_path_prepend existed (or before a tool dir appeared) keeps the
+  -- sshd PATH, which hides cargo/pip/npm tools. Runs AFTER Env.push so an
+  -- env.txt PATH stays the base. Best-effort: log only.
+  Ssh.push_remote_path(state.control, cfg, layout.home)
+
   -- re-apply the workspace's persisted forwards (forward_on_connect):
   -- async so it never delays the attach; its messages surface in the
   -- attached UI through the control channel.
@@ -453,6 +459,11 @@ local function prepare_probe(opts)
     Util.report_error(perr)
     return nil
   end
+  -- The effective remote PATH (after the remote_path_prepend augmentation):
+  -- the first thing to check when a remote tool (tree-sitter, an LSP, ...)
+  -- is reported as missing, see :SshDevLog.
+  local remote_path = probe.path or ''
+  Util.log('remote PATH: %s', remote_path ~= '' and remote_path or '?')
   return cfg, parsed, probe
 end
 

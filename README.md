@@ -391,6 +391,55 @@ Troubleshooting:
 
 Full implementation notes: [docs/environment.md](docs/environment.md).
 
+### Remote tool PATH (cargo, pipx, nvim-treesitter)
+
+`ssh` runs sshdev's scripts (and therefore the remote nvim server) in a
+**non-interactive, non-login** shell, which does not read `~/.bashrc` /
+`~/.profile`. Tools installed into a per-user directory are then invisible to
+the remote session even when your interactive shell finds them. The classic
+symptom is nvim-treesitter failing to build a parser right after
+`cargo install tree-sitter-cli` succeeded:
+
+```text
+[nvim-treesitter/install/toml] error: Error during "tree-sitter build":
+vim/_core/system:324: ENOENT: no such file or directory (cmd): 'tree-sitter'
+```
+
+sshdev therefore prepends the usual per-user tool directories to the PATH of
+the remote server and of every remote script it runs (nvim download, headless
+plugin install, `:terminal`, LSPs, jobs):
+
+```lua
+require('sshdev').setup({
+  remote_path_prepend = { '~/.cargo/bin', '~/.local/bin', '~/bin' },  -- default
+})
+```
+
+- Entries may be `~`, `~/...` or absolute paths (e.g. `'/opt/llvm/bin'`).
+- Only directories that **exist** are added, in list order, once each; a
+  directory already on PATH is left alone.
+- Set `remote_path_prepend = {}` to keep ssh's PATH exactly as it is.
+- The list is not part of the config content hash: changing it never triggers
+  a config upload or plugin reinstall.
+- An **already running** server receives the new PATH through the RPC control
+  channel on the next `:SshDevConnect` / `:SshDevAttach`, so processes started
+  afterwards (a new LSP, `:terminal`, `:TSInstall`) see it; an LSP that is
+  already running keeps its old environment and needs a restart. A **stopped**
+  server gets it from the start script on the next start.
+- `PATH=` in the workspace `env.txt` (`:SshDevEnv`) still applies: it becomes
+  the base and `remote_path_prepend` is prepended on top of it.
+- Your uploaded config runs on the **remote** host, so platform-specific
+  `vim.env` settings inside it (for example `vim.env.CC = 'clang.exe'` on
+  Windows) apply there too. Guard them with `vim.fn.has('win32') == 1` (or
+  `vim.env.SSHDEV_REMOTE == '1'`) if they are client-only.
+
+| Symptom | Meaning / fix |
+| --- | --- |
+| `ENOENT ... (cmd): 'tree-sitter'` from nvim-treesitter | the remote PATH lacks the CLI's directory. `:SshDevLog` shows the `remote PATH:` line; add the directory to `remote_path_prepend` and reconnect (`:SshDevConnect!` for a server started before the update) |
+| a remote LSP / formatter is reported as missing | same cause: its install directory is not in `remote_path_prepend`; add it there, or declare `PATH=...` in `env.txt` |
+| `cargo` works in a remote shell but not in the session | the cargo env is loaded by `~/.profile`, which the non-interactive ssh shell never reads — that is exactly what `remote_path_prepend` restores |
+| `tree-sitter build` fails with `Failed to execute the C compiler ... clang.exe` | the uploaded config sets a client-only `CC`/`CXX`; the config runs on the remote OS. Guard the assignment with `vim.fn.has('win32')` (see the bullet above) |
+
 ### Telescope
 
 ```vim
@@ -617,6 +666,8 @@ require('sshdev').setup({
   install_commands = { 'Lazy! restore' },
   excludes = { '.git', '.github' },
 
+  remote_path_prepend = { '~/.cargo/bin', '~/.local/bin', '~/bin' },
+
   attach = 'auto',           -- "auto" | "terminal" | "connect" | "command"
   history = true,            -- remember connections for the picker
   history_limit = 50,
@@ -635,6 +686,9 @@ Notes:
   headless install run.
 - `excludes` are globbed against config-relative paths and are part of the
   content hash: changing them creates a new nvim profile (a one-time install).
+- `remote_path_prepend` is the remote PATH for the server and every remote
+  script; only directories that exist are added (see
+  [Remote tool PATH](#remote-tool-path-cargo-pipx-nvim-treesitter)).
 - `nvim_profile` is normally `'auto'`; pin a key to reuse a specific existing
   profile for a new workspace.
 - `forward_on_connect` / `env_on_connect` (both default `true`) replay

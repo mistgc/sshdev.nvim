@@ -17,6 +17,64 @@
 
 local M = {}
 
+local Util = require('sshdev.util')
+
+-----------------------------------------------------------------------
+-- Remote environment prologue
+-----------------------------------------------------------------------
+
+---POSIX sh fragment that prepends the configured tool directories to PATH.
+---
+---Why this exists: sshdev starts the remote nvim (and runs every remote
+---script) through a NON-interactive, non-login shell (`ssh host sh -s`).
+---That shell does not read ~/.bashrc / ~/.profile, so the PATH is the sshd
+---default and misses the per-user directories an interactive login gets --
+---most visibly ~/.cargo/bin, where `cargo install tree-sitter-cli` lands.
+---nvim-treesitter then fails with
+---`ENOENT: no such file or directory (cmd): 'tree-sitter'` even though the
+---CLI is installed. LSP servers / formatters in ~/.local/bin are hidden by
+---the same difference.
+---
+---Only directories that EXIST are added, an entry already on PATH is left
+---alone (no duplicates), and the relative order of the entries is kept.
+---Runs before a template's own `set -eu`, so `PATH` may even be unset.
+---Entries: "~", "~/..." or absolute paths (Config validates the list).
+---@param entries string[]|nil
+---@return string fragment ('' when there is nothing to prepend)
+function M.path_augment(entries)
+  if not entries or #entries == 0 then
+    return ''
+  end
+  local words = {}
+  for _, entry in ipairs(entries) do
+    if entry == '~' then
+      words[#words + 1] = '"$HOME"'
+    elseif entry:sub(1, 2) == '~/' then
+      words[#words + 1] = '"$HOME"/' .. Util.shquote(entry:sub(3))
+    else
+      words[#words + 1] = Util.shquote(entry)
+    end
+  end
+  return table.concat({
+    '# sshdev: expose login-shell tool dirs to this non-interactive shell',
+    "_sshdev_add=''",
+    'for _sshdev_dir in ' .. table.concat(words, ' ') .. '; do',
+    '  if [ -d "$_sshdev_dir" ]; then',
+    '    case ":$PATH:$_sshdev_add" in',
+    '      *":$_sshdev_dir:"*) ;;',
+    '      *) _sshdev_add="$_sshdev_add$_sshdev_dir:" ;;',
+    '    esac',
+    '  fi',
+    'done',
+    'if [ -n "$_sshdev_add" ]; then',
+    '  PATH="$_sshdev_add$PATH"',
+    'fi',
+    'unset _sshdev_dir _sshdev_add',
+    'export PATH',
+    '',
+  }, '\n')
+end
+
 -----------------------------------------------------------------------
 -- Templates
 -----------------------------------------------------------------------
@@ -25,6 +83,7 @@ local M = {}
 M.probe = [[
 set -eu
 printf 'SSHDEV:HOME=%s\n' "$HOME"
+printf 'SSHDEV:PATH=%s\n' "$PATH"
 printf 'SSHDEV:SYS=%s\n' "$(uname -s 2>/dev/null || echo unknown)"
 printf 'SSHDEV:MACHINE=%s\n' "$(uname -m 2>/dev/null || echo unknown)"
 command -v curl >/dev/null 2>&1 && printf 'SSHDEV:CURL=yes\n' || printf 'SSHDEV:CURL=no\n'

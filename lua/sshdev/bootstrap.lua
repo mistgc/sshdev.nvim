@@ -93,7 +93,7 @@ end
 ---pickers) gains the fallback transparently.
 ---@param cfg table
 ---@param parsed table
----@return table? probe { home, sys, machine }
+---@return table? probe { home, path, sys, machine }
 ---@return string? err
 function M.probe(cfg, parsed)
   local function attempt()
@@ -144,6 +144,7 @@ function M.probe(cfg, parsed)
   end
   return {
     home = kv.HOME,
+    path = kv.PATH or '',
     sys = kv.SYS or 'unknown',
     machine = kv.MACHINE or 'unknown',
   }

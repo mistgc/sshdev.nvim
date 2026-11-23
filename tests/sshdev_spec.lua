@@ -334,6 +334,37 @@ T.describe('config validation: rejects', function()
   end
 end)
 
+T.describe('config remote_path_prepend (remote tool PATH)', function()
+  local cfg, err = Config.build({})
+  eq(err, nil, 'default config validates')
+  eq(cfg.remote_path_prepend, { '~/.cargo/bin', '~/.local/bin', '~/bin' },
+    'the default tool dirs include the cargo bin dir')
+
+  eq(Config.build({ remote_path_prepend = {} }).remote_path_prepend, {},
+    '{} disables the augmentation')
+  eq(
+    Config.build({ remote_path_prepend = { '/opt/tools/bin' } }).remote_path_prepend,
+    { '/opt/tools/bin' },
+    'a user list replaces the defaults (merge() must not keep the trailing entries)'
+  )
+
+  for _, bad in ipairs({
+    '~/bin', -- not a list
+    { 'relative/bin' },
+    { '~user/bin' },
+    { '' },
+    { '/ok\nno' },
+    { 3 },
+  }) do
+    local _, berr = Config.build({ remote_path_prepend = bad })
+    ok(berr ~= nil, ('remote_path_prepend rejects %s'):format(vim.inspect(bad)))
+  end
+  for _, good in ipairs({ { '~' }, { '~/x' }, { '/opt/x y' }, { '~/a/b', '/c' } }) do
+    local _, gerr = Config.build({ remote_path_prepend = good })
+    eq(gerr, nil, ('remote_path_prepend accepts %s'):format(vim.inspect(good)))
+  end
+end)
+
 T.describe('config.get falls back to defaults', function()
   local cfg = Config.get()
   eq(cfg.remote_root, '~/.sshdev.nvim')
@@ -679,6 +710,63 @@ T.describe('remote scripts: templates render completely', function()
   end
 end)
 
+T.describe('remote scripts: probe reports the effective PATH', function()
+  local rendered = render_all()
+  ok(rendered.probe:find('SSHDEV:PATH=%s', 1, true) ~= nil, 'probe prints $PATH')
+  eq(Util.parse_keyvals('SSHDEV:HOME=/h\nSSHDEV:PATH=/a:/b\nSSHDEV:SH=ok\n').PATH, '/a:/b',
+    'the probe PATH line parses')
+end)
+
+T.describe('remote scripts: path_augment (login-shell tool dirs on PATH)', function()
+  eq(Scripts.path_augment(nil), '', 'nil -> no fragment')
+  eq(Scripts.path_augment({}), '', 'empty list -> no fragment')
+
+  local frag = Scripts.path_augment({ '~/.cargo/bin', '/opt/x y', '~' })
+  ok(frag:find([[for _sshdev_dir in "$HOME"/'.cargo/bin' '/opt/x y' "$HOME"; do]], 1, true) ~= nil,
+    '~ expands through $HOME, absolute entries are quoted')
+  ok(frag:find('[ -d "$_sshdev_dir" ]', 1, true) ~= nil, 'directory existence is checked')
+  ok(frag:find('*":$_sshdev_dir:"*', 1, true) ~= nil, 'entries already on PATH are skipped')
+  ok(frag:find('PATH="$_sshdev_add$PATH"', 1, true) ~= nil,
+    'the existing dirs are prepended as one block (config order kept)')
+  ok(frag:find('export PATH', 1, true) ~= nil, 'PATH is exported to the child processes')
+end)
+
+T.describe('remote scripts: path_augment executes like a login PATH', function()
+  if vim.fn.executable('sh') ~= 1 then
+    print('  SKIP: no POSIX sh in PATH')
+    return
+  end
+  local base = 'tests/.tmp/path-augment'
+  Util.rmrf(base)
+  Util.mkdir_p(base .. '/home/.cargo/bin')
+  Util.mkdir_p(base .. '/home/custom bin')
+  Util.mkdir_p(base .. '/opt/tools')
+  local frag = Scripts.path_augment({
+    '~/.cargo/bin',
+    '~/.local/bin', -- does not exist: must be skipped
+    '~/custom bin',
+    base .. '/opt/tools',
+    '/nonexistent/tool/bin',
+  })
+  local script = table.concat({
+    'HOME=' .. base .. '/home',
+    'PATH=/usr/bin:/bin',
+    frag,
+    frag, -- a second run must not duplicate anything
+    'printf "%s\\n" "$PATH"',
+    '',
+  }, '\n')
+  write_file(base .. '/run.sh', script)
+  local res = vim.system({ 'sh', base .. '/run.sh' }, { cwd = REPO_ROOT, text = true }):wait()
+  eq(res.code, 0, 'the fragment runs: ' .. tostring(res.stderr))
+  eq(
+    vim.trim(res.stdout),
+    base .. '/home/.cargo/bin:' .. base .. '/home/custom bin:' .. base .. '/opt/tools:/usr/bin:/bin',
+    'existing dirs only, config order kept, ssh PATH preserved, no duplicates'
+  )
+  Util.rmrf(base)
+end)
+
 T.describe('remote scripts: ensure (bin + read-only profile state)', function()
   local rendered, layout = render_all()
   local ensure = rendered.ensure
@@ -801,11 +889,17 @@ T.describe('remote scripts: sh -n syntax check', function()
     return
   end
   local rendered = render_all()
+  -- every remote script is sent with the prologue (env.txt exports + PATH
+  -- augmentation) prepended by Ssh.run_script: the combination must be
+  -- valid POSIX sh for every template.
+  Env.clear()
+  local prologue = Ssh.script_prologue(Config.build({}), Util.parse_dest('me@host'))
+  ok(prologue:find('_sshdev_dir', 1, true) ~= nil, 'the prologue carries the PATH augmentation')
   local dir = vim.fs.joinpath(vim.fn.stdpath('cache'), 'sshdev-test-sh')
   Util.rmrf(dir)
   for name, text in pairs(rendered) do
     local f = vim.fs.joinpath(dir, name .. '.sh')
-    write_file(f, text)
+    write_file(f, prologue .. text)
     local res = vim.system({ 'sh', '-n', f }, { text = true }):wait()
     eq(res.code, 0, ('sh -n %s failed: %s'):format(name, tostring(res.stderr)))
   end
@@ -1358,6 +1452,65 @@ T.describe('env.script_prefix: values survive sh verbatim', function()
   eq(res.code, 0, 'the exported script runs: ' .. tostring(res.stderr))
   eq(res.stdout, value .. '\n[]\n', 'quotes, $, &, = and spaces arrive verbatim')
   Env.clear()
+end)
+
+T.describe('ssh.script_prologue: env exports first, then the PATH augmentation', function()
+  local parsed = Util.parse_dest('me@host')
+  Env.clear()
+  local cfg = Config.build({})
+  local prologue = Ssh.script_prologue(cfg, parsed)
+  ok(prologue:find('_sshdev_dir', 1, true) ~= nil, 'the PATH augmentation is present')
+  eq(Ssh.script_prologue(Config.build({ remote_path_prepend = {} }), parsed), '',
+    'disabled -> no prologue at all')
+
+  Env.set_active({ PATH = '/opt/tools/bin' }, parsed)
+  prologue = Ssh.script_prologue(cfg, parsed)
+  local export_at = prologue:find("export PATH='/opt/tools/bin'", 1, true)
+  local augment_at = prologue:find('_sshdev_dir', 1, true)
+  ok(export_at ~= nil, 'the env.txt PATH is exported')
+  ok(augment_at ~= nil and export_at < augment_at,
+    'the augmentation is applied on top of the env.txt PATH')
+  Env.clear()
+end)
+
+T.describe('ssh.PATH_CHUNK: heals the PATH of a running server', function()
+  local base = 'tests/.tmp/path-chunk'
+  Util.rmrf(base)
+  Util.mkdir_p(base .. '/cargo/bin')
+  Util.mkdir_p(base .. '/local/bin')
+  local cargo = vim.fs.abspath(base .. '/cargo/bin')
+  local local_bin = vim.fs.abspath(base .. '/local/bin')
+  local missing = vim.fs.abspath(base .. '/missing/bin')
+
+  local saved = vim.env.PATH
+  local okrun, err = pcall(function()
+    local chunk = assert(load(Ssh.PATH_CHUNK), 'PATH_CHUNK compiles')
+
+    vim.env.PATH = '/usr/bin:/bin'
+    chunk({ cargo, missing, local_bin, '/usr/bin' })
+    eq(vim.env.PATH, cargo .. ':' .. local_bin .. ':/usr/bin:/bin',
+      'existing dirs prepended in order, missing dirs and duplicates skipped')
+
+    chunk({ cargo, local_bin })
+    eq(vim.env.PATH, cargo .. ':' .. local_bin .. ':/usr/bin:/bin', 'idempotent')
+
+    vim.env.PATH = ''
+    chunk({ cargo })
+    eq(vim.env.PATH, cargo .. ':', 'an empty PATH is a valid base')
+  end)
+  vim.env.PATH = saved
+  Util.rmrf(base)
+  ok(okrun, tostring(err))
+end)
+
+T.describe('ssh.push_remote_path: best effort only', function()
+  eq(Ssh.push_remote_path(nil, Config.build({}), '/home/me'), false, 'no control channel -> no-op')
+  eq(Ssh.push_remote_path({ ch = 1 }, Config.build({}), ''), false, 'unknown remote HOME -> no-op')
+  eq(
+    Ssh.push_remote_path({ ch = 1 }, Config.build({ remote_path_prepend = {} }), '/home/me'),
+    false,
+    'disabled -> no-op'
+  )
 end)
 
 T.describe('env: runtime chunk sets and unsets vim.env', function()

@@ -73,6 +73,12 @@ function M.check()
   end
   vim.health.ok(('session persistence: %s'):format(cfg.session and 'on (per-workspace session.vim)' or 'off'))
   vim.health.info(('attach strategy: %s'):format(cfg.attach))
+  if #cfg.remote_path_prepend > 0 then
+    vim.health.info(('remote PATH prepend: %s (existing dirs only; ssh does not read shell rc files)')
+      :format(table.concat(cfg.remote_path_prepend, ', ')))
+  else
+    vim.health.info('remote PATH prepend: disabled (tools outside the ssh PATH are invisible remotely)')
+  end
   vim.health.info(('bootstrap lock timeout: %ss'):format(cfg.timeouts.lock))
 
   -- auth mode: askpass capability + helper checks (when a password may be used)

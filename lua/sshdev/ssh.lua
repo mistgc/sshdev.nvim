@@ -77,12 +77,87 @@ local function proc_env(cfg, parsed)
   return Util.merge_env(Env.spawn_overlay(parsed), Auth.env(cfg, parsed))
 end
 
+---Text prepended to EVERY remote script (ahead of its own `set -eu`):
+---the workspace's env.txt exports, then the remote PATH augmentation.
+---
+---Order matters: an env.txt `PATH=...` is the BASE and the configured tool
+---directories (cfg.remote_path_prepend) are prepended to it. Every remote
+---action goes through |run_script|, so this one prologue covers the nvim
+---download, the headless plugin install, the server start -- and therefore
+---every child the server spawns later (LSPs, |:terminal|, nvim-treesitter's
+---`tree-sitter build`) -- plus the small control scripts.
+---@param cfg table
+---@param parsed table
+---@return string
+function M.script_prologue(cfg, parsed)
+  local Env = require('sshdev.env') -- lazy: env.lua requires this module
+  return Env.script_prefix(parsed) .. Scripts.path_augment(cfg.remote_path_prepend)
+end
+
+---Lua chunk run ON the remote nvim server through the control channel.
+---
+---A server started BEFORE remote_path_prepend existed (or before a tool dir
+---appeared) would keep the sshd PATH forever. This chunk prepends the
+---configured directories to the RUNNING server's `vim.env.PATH`, so children
+---started from now on (`:TSInstall`, |:terminal|, jobs) find the tools
+---without a restart. Already-running children keep their environment -- the
+---same trade-off as every runtime environment push.
+---
+---`dirs` are absolute (expanded client-side against the remote $HOME); only
+---existing directories are added, deduplicated, and the order is preserved.
+M.PATH_CHUNK = [[
+local dirs = select(1, ...)
+local path = vim.env.PATH or ''
+local seen = ':' .. path .. ':'
+local add = {}
+for _, d in ipairs(dirs) do
+  if d ~= '' and vim.fn.isdirectory(d) == 1 and not seen:find(':' .. d .. ':', 1, true) then
+    add[#add + 1] = d
+    seen = seen .. d .. ':'
+  end
+end
+if #add > 0 then
+  vim.env.PATH = table.concat(add, ':') .. ':' .. path
+end
+]]
+
+---Push the configured PATH augmentation into a RUNNING server.
+---
+---Best effort: without a control channel (or with the feature disabled) the
+---server keeps its environment; a stopped server gets it from the start
+---script on the next :SshDevConnect.
+---@param control table|nil { ch, remote_id } from open_control_channel()
+---@param cfg table
+---@param home string|nil remote $HOME, used to expand "~" entries
+---@return boolean sent
+function M.push_remote_path(control, cfg, home)
+  local entries = (cfg and cfg.remote_path_prepend) or {}
+  if not control or type(control.ch) ~= 'number' or #entries == 0 then
+    return false
+  end
+  if type(home) ~= 'string' or home == '' then
+    return false
+  end
+  local dirs = {}
+  for _, entry in ipairs(entries) do
+    dirs[#dirs + 1] = Util.expand_remote_home(entry, home)
+  end
+  local ok, sent = pcall(vim.fn.rpcnotify, control.ch, 'nvim_exec_lua', M.PATH_CHUNK, { dirs })
+  if ok and sent == 1 then
+    Util.log('remote PATH: augmentation pushed to the running server')
+    return true
+  end
+  Util.log('remote PATH: the running server is unreachable; it applies on the next start')
+  return false
+end
+
 ---Run a POSIX sh script on the remote host. The script is fed on stdin of
 ---`sh -s`; parameters are embedded by the caller via Util.render().
 ---
----The workspace's injected environment is exported at the top of the
----script, so the remote command sees those variables (the job's env only
----affects the LOCAL ssh process).
+---The script is prefixed with |script_prologue|: the workspace's injected
+---environment (env.txt) is exported there and the configured tool
+---directories are prepended to PATH, so the remote command sees both (the
+---job's env only affects the LOCAL ssh process).
 ---Returns the await() result: { code, stdout, stderr, timed_out }.
 ---@param cfg table
 ---@param parsed table
@@ -91,7 +166,7 @@ end
 ---@return table
 function M.run_script(cfg, parsed, script, opts)
   opts = opts or {}
-  local prefix = require('sshdev.env').script_prefix(parsed)
+  local prefix = M.script_prologue(cfg, parsed)
   if prefix ~= '' then
     script = prefix .. script
   end

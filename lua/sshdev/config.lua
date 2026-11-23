@@ -114,6 +114,23 @@ M.defaults = {
   ---Globs of files to exclude from the config upload.
   excludes = { '.git', '.github' },
 
+  ---Directories prepended to PATH ON THE REMOTE HOST, for the nvim server and
+  ---every remote script sshdev runs.
+  ---
+  ---ssh starts a NON-interactive, non-login shell (`ssh host sh -s`), which
+  ---does not read ~/.bashrc / ~/.profile. Tools installed into per-user
+  ---directories are therefore invisible to the remote nvim even when they are
+  ---on the PATH of an interactive session -- nvim-treesitter's
+  ---`tree-sitter build` then fails with
+  ---`ENOENT: no such file or directory (cmd): 'tree-sitter'` after a successful
+  ---`cargo install tree-sitter-cli`, and LSPs/formatters in ~/.local/bin are
+  ---not found either.
+  ---
+  ---Entries may be "~", "~/..." or absolute paths. Only existing directories
+  ---are added, and only once; an entry already on PATH is left alone. Set an
+  ---empty list ({}) to keep the exact PATH ssh provides.
+  remote_path_prepend = { '~/.cargo/bin', '~/.local/bin', '~/bin' },
+
   ---How the local UI attaches to the remote server (needs Nvim >= 0.12,
   ---the release that added :connect):
   ---  "auto"      use |:connect| with the tunnel address (the builtin TUI
@@ -196,6 +213,13 @@ function M.build(opts)
   -- dropped option: the content hash decides when to resync now.
   opts.force_sync = nil
   local cfg = merge(vim.deepcopy(M.defaults), opts)
+  -- merge() combines two tables index-wise, which would keep the trailing
+  -- DEFAULT entries when the user passes a shorter list. remote_path_prepend
+  -- is a list of directories, so a user-provided list must REPLACE the
+  -- default one (remote_path_prepend = { '/opt/bin' } means exactly that).
+  if opts.remote_path_prepend ~= nil then
+    cfg.remote_path_prepend = vim.deepcopy(opts.remote_path_prepend)
+  end
   local err = M.validate(cfg)
   return cfg, err
 end
@@ -329,6 +353,21 @@ function M.validate(cfg)
   end
   if not is_list_of_strings(cfg.excludes) then
     return 'setup: "excludes" must be a list of glob strings'
+  end
+  -- remote PATH augmentation (see the option's doc comment)
+  if not is_list_of_strings(cfg.remote_path_prepend) then
+    return 'setup: "remote_path_prepend" must be a list of remote directories'
+  end
+  for _, d in ipairs(cfg.remote_path_prepend) do
+    if d == '' then
+      return 'setup: "remote_path_prepend" must not contain an empty entry'
+    end
+    if d ~= '~' and d:sub(1, 1) ~= '/' and d:sub(1, 2) ~= '~/' then
+      return ('setup: "remote_path_prepend": %q must be absolute or "~/..."'):format(d)
+    end
+    if d:find('[\r\n\t]') or d:find('\0', 1, true) then
+      return ('setup: "remote_path_prepend": %q must not contain control characters'):format(d)
+    end
   end
   if not vim.tbl_contains({ 'auto', 'terminal', 'connect', 'command' }, cfg.attach) then
     return 'setup: "attach" must be one of "auto", "terminal", "connect", "command"'
