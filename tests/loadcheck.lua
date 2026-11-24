@@ -25,6 +25,8 @@ local modules = {
   'sshdev.env',
   'sshdev.history',
   'sshdev.picker',
+  'sshdev.proxy',
+  'sshdev.proxy_proto',
   'sshdev.session',
   'sshdev.health',
   'sshdev',
@@ -48,6 +50,15 @@ if ok then
 else
   failures = failures + 1
   print(('FAIL: scripts/remote_session.lua: %s'):format(tostring(err)))
+end
+
+-- the reconnect proxy is a standalone nvim script: it must at least compile
+local pok, perr = loadfile(root .. '/scripts/ui_proxy.lua')
+if pok then
+  print('OK:   scripts/ui_proxy.lua (compiles)')
+else
+  failures = failures + 1
+  print(('FAIL: scripts/ui_proxy.lua: %s'):format(tostring(perr)))
 end
 
 -- the telescope extension is only loadable when telescope is installed;

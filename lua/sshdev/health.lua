@@ -32,6 +32,11 @@ function M.check()
 
   -- 2. local tools
   local cfg = Config.get()
+  if cfg.reconnect and Session.attach_strategy(cfg.attach, Session.ui_kind()) == 'connect' then
+    vim.health.ok('network-drop reconnect: enabled (local relay keeps the UI alive)')
+  else
+    vim.health.info('network-drop reconnect: disabled (a dropped :connect channel exits this nvim)')
+  end
   for _, bin in ipairs({ cfg.ssh_bin, cfg.scp_bin }) do
     if vim.fn.executable(bin) == 1 then
       vim.health.ok(('%s is executable'):format(bin))
