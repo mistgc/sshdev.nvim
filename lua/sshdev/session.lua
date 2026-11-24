@@ -68,7 +68,11 @@ end
 ---@return string? err
 local function guard_local()
   if vim.env.SSHDEV_REMOTE == '1' then
-    return false, 'this nvim IS a sshdev remote server; refusing to nest sshdev sessions'
+    return false, 'this nvim is the sshdev REMOTE server (the UI is attached to it): '
+      .. 'run connection commands from the client -- :detach exits this UI (the '
+      .. 'server keeps running), then run the command locally and :SshDevAttach. '
+      .. 'Client-owned commands (:SshDevStop, :SshDevStatus, :SshDevSync, '
+      .. ':SshDevInstall, :SshDevProfiles) are forwarded automatically'
   end
   -- Verified against real binaries: :detach exists since 0.11, but :connect
   -- (and --remote-ui) only since 0.12. Both ends are version-matched, so the
@@ -233,6 +237,36 @@ end
 
 M.attach_strategy = attach_strategy
 
+---Make local user-facing messages visible in the ATTACHED remote UI.
+---
+---After the UI ":connect"s to the remote server this nvim is headless, so
+---its own `vim.notify()` output has no surface. Worse, a multi-line
+---notification would make this headless nvim wait on an invisible
+---"Press ENTER" prompt and freeze the RPC control channel. Installed right
+---after a successful `:connect`; while it is active it REPLACES the local
+---surface (see |Util.set_message_mirror|), so a forwarded |:SshDevStop|
+---reports its progress into the remote UI without stalling the client.
+---
+---The closure reads `state.control` on every message, so it follows a
+---channel that is re-opened after a reconnect, and a failed send is only
+---logged (the command still runs).
+local function install_message_mirror()
+  Util.set_message_mirror(function(text, level, transient)
+    local c = state.control
+    if not c or type(c.ch) ~= 'number' then
+      return true -- still suppress the local (headless) surface
+    end
+    local chunk = transient
+        and 'local m = ...; vim.api.nvim_echo({{m, "None"}}, false, {})'
+      or 'local m, l = ...; vim.notify(m, l or vim.log.levels.INFO)'
+    local ok, sent = pcall(vim.fn.rpcnotify, c.ch, 'nvim_exec_lua', chunk, { text, level })
+    if not ok or sent == 0 or sent == false then
+      Util.log('message mirror: the attached UI could not be reached')
+    end
+    return true
+  end)
+end
+
 ---Attach this UI to the remote server according to cfg.attach.
 ---@param cfg table
 ---@param addr string "host:port" through the local tunnel
@@ -252,6 +286,10 @@ local function attach_ui(cfg, addr)
       state.attached = false
       fail(':connect failed: ' .. tostring(cerr))
     end
+    -- The UI now lives in the remote server: local notifications have no
+    -- surface and would block this headless nvim (hit-enter), so from here
+    -- on they are mirrored into the attached UI.
+    install_message_mirror()
     Util.log('UI attached via :connect %s', addr)
     return
   end
@@ -270,7 +308,8 @@ end
 ---Open the RPC control channel to the remote server through the tunnel
 ---and announce our channel id (`_G.SSHDEV_CONTROL_CHANNEL` on the remote).
 ---The remote uses it to push CLIENT-side actions for commands typed
----inside the attached session (the forward.txt apply of |:SshDevForward|):
+---inside the attached session (the forward.txt apply of |:SshDevForward|,
+---the client-owned commands of |forward_to_client|):
 ---"remote -> rpcnotify -> nvim_exec_lua" runs in THIS nvim even while its
 ---UI is attached to the remote. Best-effort: nil when unavailable.
 ---@param lport integer local tunnel port
@@ -300,10 +339,139 @@ local function open_control_channel(lport)
 end
 
 ---Close the control channel (detach/stop/teardown/re-open).
+---The message mirror is intentionally NOT cleared here: an error raised
+---after the teardown started must not fall back to the invisible local
+---surface (a headless nvim would block on the hit-enter prompt). It is
+---cleared by |teardown_local|, or replaced by the next install.
 local function close_control_channel()
   if state.control then
     pcall(vim.fn.chanclose, state.control.ch)
     state.control = nil
+  end
+end
+
+-----------------------------------------------------------------------
+-- Client-owned commands (typed inside the ATTACHED remote session)
+-----------------------------------------------------------------------
+
+---Commands that can only run on the CLIENT: it owns the ssh tunnel, the
+---reconnect proxy, the user forwards, both profile trees and the remote
+---server process. Typed inside the attached remote UI they used to run in
+---the remote server and fail (or, worse, report "no active session"):
+---the remote now forwards the request over the control channel and the
+---client executes it (|forward_to_client| / |_remote_command|).
+---
+---`target` commands take [dest] [workspace]; when the user passed
+---neither, the receiver fills them from the ACTIVE session, so
+---`:SshDevSync` inside the attached UI means "this workspace".
+local CLIENT_COMMANDS = {
+  SshDevStop = { method = 'stop' },
+  SshDevStatus = { method = 'status' },
+  SshDevSync = { method = 'sync', target = true },
+  SshDevInstall = { method = 'install', target = true },
+  SshDevProfiles = { method = 'profiles', target = true },
+}
+
+---True when `name` is a client-owned command (see CLIENT_COMMANDS).
+---@param name string
+---@return boolean
+function M.is_client_command(name)
+  return CLIENT_COMMANDS[name] ~= nil
+end
+
+---REMOTE side of the client-owned commands: hand the request to the nvim
+---that owns this session. Returns true when the call was handled (so the
+---public entry point does not run it in the remote server).
+---
+---Without a control channel the user gets actionable guidance instead of
+---a confusing "no active session" result. Best effort: a dead channel is
+---treated the same way.
+---@param name string :SshDev* command name
+---@param opts table|nil parsed command arguments
+---@return boolean handled
+function M.forward_to_client(name, opts)
+  if vim.env.SSHDEV_REMOTE ~= '1' then
+    return false
+  end
+  local ch = _G.SSHDEV_CONTROL_CHANNEL
+  if type(ch) ~= 'number' then
+    Util.notify(
+      ('this is the sshdev remote server and the client control channel is not '
+        .. 'available: run :%s from the client -- :detach exits this UI (the '
+        .. 'server keeps running), then run the command in the local nvim and '
+        .. ':SshDevAttach to return'):format(name),
+      vim.log.levels.WARN
+    )
+    return true
+  end
+  local ok, sent = pcall(
+    vim.fn.rpcnotify,
+    ch,
+    'nvim_exec_lua',
+    'require("sshdev.session")._remote_command(select(1, ...))',
+    { name, opts or {} }
+  )
+  if not ok or sent == 0 or sent == false then
+    Util.notify(
+      ('the client could not be reached; run :%s from the client (:detach, '
+        .. 'then the command, then :SshDevAttach)'):format(name),
+      vim.log.levels.WARN
+    )
+    return true
+  end
+  -- Transient ack: the result follows as ordinary notifications, and a
+  -- history message would force an extra "Press ENTER" before it.
+  Util.status((':%s was forwarded to the client (it owns the tunnel and the remote server)'):format(name))
+
+  -- A failed stop leaves this server running, and by then the client has
+  -- already closed the control channel: without this timer the failure
+  -- would be silent here (the client logs it). A successful stop kills
+  -- this nvim long before the timer fires.
+  if name == 'SshDevStop' then
+    vim.defer_fn(function()
+      if vim.env.SSHDEV_REMOTE == '1' then
+        Util.notify(
+          'the client has not finished stopping this server: check the client '
+            .. ':SshDevLog, then retry :SshDevStop',
+          vim.log.levels.WARN
+        )
+      end
+    end, 20000)
+  end
+  return true
+end
+
+---CLIENT side of |forward_to_client|: the attached remote session asked
+---this nvim (the one that owns the tunnel) to run a client-owned command.
+---
+---Only whitelisted names are honored, so a remote cannot make the client
+---execute arbitrary functions. `[dest] [workspace]` default to the ACTIVE
+---session for the commands that accept them. Runs through the normal
+---public entry points, so the outcome is mirrored into the remote UI (see
+---|install_message_mirror|).
+---@param name string
+---@param opts table|nil
+function M._remote_command(name, opts)
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return -- never execute in the remote server itself
+  end
+  local spec = CLIENT_COMMANDS[name]
+  if not spec then
+    Util.log('ignoring a remote request for an unsupported client command: %s', tostring(name))
+    return
+  end
+  opts = vim.deepcopy(type(opts) == 'table' and opts or {})
+  local info = state.info
+  if spec.target and info and opts.dest == nil and opts.workspace == nil then
+    opts.dest = info.dest
+    opts.workspace = info.workspace
+    Util.log('remote :%s -> active session %s (%s)', name, info.dest, info.workspace)
+  else
+    Util.log('handling a remote request for :%s', name)
+  end
+  local ok, err = pcall(M[spec.method], opts)
+  if not ok then
+    Util.report_error(err)
   end
 end
 
@@ -401,6 +569,12 @@ local function start_control_keeper(cfg, parsed, control_port)
       if ch then
         state.control = ch
         state.reconnected = true
+        -- the mirror closure reads state.control, but a session that keeps
+        -- running after a detach must still not fall back to the headless
+        -- local surface: re-install it (idempotent) for an attached UI.
+        if state.attached then
+          install_message_mirror()
+        end
         Util.log('control channel restored for %s', info.dest)
         pcall(vim.fn.rpcnotify, ch, 'nvim_echo', {
           { ('[sshdev] reconnected to %s'):format(info.dest) },
@@ -959,6 +1133,10 @@ end
 ---`:SshDevInstall [dest] [workspace]` — bootstrap only, no server/attach.
 function M.install(opts)
   opts = opts or {}
+  -- client-owned command: typed in the attached remote UI it belongs HERE
+  if M.forward_to_client('SshDevInstall', opts) then
+    return
+  end
   Proc.launch(function()
     Env.clear()
     local cfg, parsed, layout, probe = prepare(opts)
@@ -1011,6 +1189,10 @@ end
 ---`:SshDevSync [dest] [workspace]` — re-upload config + helper (and reinstall).
 function M.sync(opts)
   opts = opts or {}
+  -- client-owned command: the config lives on the client
+  if M.forward_to_client('SshDevSync', opts) then
+    return
+  end
   Proc.launch(function()
     Env.clear()
     local cfg, parsed, layout, probe = prepare(opts)
@@ -1290,7 +1472,14 @@ function M._remote_forward_apply(profile)
 end
 
 ---`:SshDevStop` — stop the remote server (saves session.vim) + tunnel.
-function M.stop()
+---@param opts table|nil parsed command arguments (unused locally)
+function M.stop(opts)
+  -- Typed inside the ATTACHED remote UI this command used to run in the
+  -- remote server, where it found no local session and did nothing. The
+  -- tunnel, the proxy and the server handle live HERE.
+  if M.forward_to_client('SshDevStop', opts) then
+    return
+  end
   Proc.launch(function()
     local cfg = Config.get()
     state.keeper_gen = state.keeper_gen + 1
@@ -1338,7 +1527,12 @@ function M.auto_nvim_profile_key(cfg)
 end
 
 ---`:SshDevStatus` — session, tunnel, profiles, remote server, history.
-function M.status()
+---@param opts table|nil parsed command arguments (unused locally)
+function M.status(opts)
+  -- the state it reports (profiles, tunnel, server pid) lives on the client
+  if M.forward_to_client('SshDevStatus', opts) then
+    return
+  end
   Proc.launch(function()
     local cfg = Config.get()
     local lines = {}
@@ -1417,6 +1611,10 @@ end
 ---@param opts table|nil { dest = string }
 function M.profiles(opts)
   opts = opts or {}
+  -- client-owned command: profiles are listed per CLIENT host
+  if M.forward_to_client('SshDevProfiles', opts) then
+    return
+  end
   Proc.launch(function()
     local cfg, parsed, probe = prepare_probe(opts)
     if not cfg then
@@ -1465,6 +1663,13 @@ end
 ---@param opts table|nil
 function M.pick(opts)
   opts = opts or {}
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return Util.notify(
+      'the connection picker belongs to the client: :detach to return to it, '
+        .. 'then run :SshDevConnect',
+      vim.log.levels.WARN
+    )
+  end
   local cfg = Config.get()
   if opts.cfg then
     cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
@@ -1490,6 +1695,13 @@ end
 ---@param opts table|nil { dest = string }
 function M.pick_history(opts)
   opts = opts or {}
+  if vim.env.SSHDEV_REMOTE == '1' then
+    return Util.notify(
+      'the history picker belongs to the client: :detach to return to it, '
+        .. 'then run :SshDevHistory',
+      vim.log.levels.WARN
+    )
+  end
   local cfg = Config.get()
   if opts.cfg then
     cfg = vim.tbl_deep_extend('force', cfg, opts.cfg)
@@ -1515,6 +1727,7 @@ end
 ---(headless). The user forwards, the reconnect proxy and the control channel
 ---share the session's lifecycle.
 function M.teardown_local()
+  Util.set_message_mirror(nil)
   if state.attached then
     return
   end

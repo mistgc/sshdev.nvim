@@ -1807,6 +1807,198 @@ T.describe('env: remote-side editor (the attached session)', function()
   end
 end)
 
+T.describe('util message mirror (client -> attached remote UI)', function()
+  local orig_notify = vim.notify
+  local orig_schedule = vim.schedule
+  local seen = {}
+  local function record(text, level, transient)
+    seen[#seen + 1] = { text = text, level = level, transient = transient }
+  end
+
+  local okr, err = pcall(function()
+    local local_calls = 0
+    vim.notify = function()
+      local_calls = local_calls + 1
+    end
+    vim.schedule = function(fn)
+      fn()
+    end -- report_error would otherwise defer the assertion
+    Util.set_message_mirror(record)
+
+    Util.notify('hello', vim.log.levels.WARN)
+    eq(#seen, 1, 'notify is mirrored once')
+    eq(seen[1].text, '[sshdev] hello')
+    eq(seen[1].level, vim.log.levels.WARN)
+    eq(seen[1].transient, false, 'a notification enters the remote history')
+    eq(local_calls, 0, 'the mirror REPLACES the headless local surface')
+
+    Util.status('working')
+    eq(#seen, 2, 'status is mirrored')
+    eq(seen[2].text, '[sshdev] working')
+    eq(seen[2].transient, true, 'a status line stays transient on the remote')
+
+    Util.report_error('boom')
+    eq(#seen, 3, 'errors are mirrored')
+    eq(seen[3].text, '[sshdev] boom')
+    eq(seen[3].level, vim.log.levels.ERROR)
+    eq(local_calls, 0, 'errors do not touch the headless local surface either')
+
+    -- without a mirror the normal local notification path is used again
+    Util.set_message_mirror(nil)
+    Util.notify('local only')
+    eq(local_calls, 1, 'no mirror = the local notification path')
+
+    -- a throwing mirror must never break the local notify path
+    Util.set_message_mirror(function()
+      error('mirror exploded')
+    end)
+    local nok = pcall(Util.notify, 'still alive')
+    ok(nok, 'a broken mirror is swallowed')
+  end)
+
+  Util.set_message_mirror(nil)
+  vim.notify = orig_notify
+  vim.schedule = orig_schedule
+  if not okr then
+    error(err, 0)
+  end
+end)
+
+T.describe('session: client-owned commands forwarded from the attached session', function()
+  local saved_remote = vim.env.SSHDEV_REMOTE
+  local orig_notify = vim.notify
+  local seen = nil
+  local function notify_spy()
+    seen = nil
+    vim.notify = function(msg, level)
+      seen = { msg = msg, level = level }
+    end
+  end
+
+  local okr, err = pcall(function()
+    -- 1. the whitelist is explicit: connection/picker commands stay local
+    ok(Session.is_client_command('SshDevStop'), 'stop is client-owned')
+    ok(Session.is_client_command('SshDevStatus'), 'status is client-owned')
+    ok(Session.is_client_command('SshDevSync'), 'sync is client-owned')
+    ok(Session.is_client_command('SshDevInstall'), 'install is client-owned')
+    ok(Session.is_client_command('SshDevProfiles'), 'profiles is client-owned')
+    not_ok(Session.is_client_command('SshDevConnect'), 'connect is not forwarded')
+    not_ok(Session.is_client_command('SshDevAttach'), 'attach is not forwarded')
+
+    -- 2. remote side without a control channel: guidance, call is handled
+    vim.env.SSHDEV_REMOTE = '1'
+    _G.SSHDEV_CONTROL_CHANNEL = nil
+    notify_spy()
+    eq(Session.forward_to_client('SshDevStop', {}), true, 'the remote call is handled')
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('client control channel is not available', 1, true) ~= nil,
+      'without a channel the guidance points at the client')
+    ok(seen and seen.msg:find(':detach', 1, true) ~= nil, 'the guidance names the workflow')
+
+    -- 3. remote side with a dead channel id: same actionable fallback
+    _G.SSHDEV_CONTROL_CHANNEL = 999999
+    notify_spy()
+    eq(Session.forward_to_client('SshDevStop', {}), true, 'a dead channel is handled too')
+    vim.notify = orig_notify
+    ok(seen and seen.msg:find('could not be reached', 1, true) ~= nil,
+      'a dead channel does not raise')
+
+    -- 4. the public entry point must NOT run the command remotely: with a
+    --    live channel (stubbed here) the forward succeeds and
+    --    Bootstrap.stop_server is never reached
+    local pushed = nil
+    local orig_rpcnotify = vim.fn.rpcnotify
+    vim.fn.rpcnotify = function(ch, method, chunk, args)
+      pushed = { ch = ch, method = method, chunk = chunk, args = args }
+      return 1
+    end
+    local orig_stop_server = Bootstrap.stop_server
+    local stopped = false
+    Bootstrap.stop_server = function()
+      stopped = true
+      return true
+    end
+    local orig_status_util = Util.status
+    local status_msg = nil
+    Util.status = function(msg)
+      status_msg = msg
+    end
+    notify_spy()
+    Session.stop({})
+    vim.notify = orig_notify
+    Util.status = orig_status_util
+    Bootstrap.stop_server = orig_stop_server
+    vim.fn.rpcnotify = orig_rpcnotify
+    eq(stopped, false, ':SshDevStop does not stop anything from the remote server')
+    ok(status_msg and status_msg:find('forwarded to the client', 1, true) ~= nil,
+      'the remote says where the command went (transient ack)')
+    ok(pushed ~= nil, 'the request travels over the control channel')
+    eq(pushed and pushed.method, 'nvim_exec_lua', 'the request is an RPC notification')
+    ok(pushed and pushed.chunk:find('_remote_command', 1, true) ~= nil,
+      'the client dispatches through _remote_command')
+    eq(pushed and pushed.args[1], 'SshDevStop', 'the command name is sent')
+
+    -- 5. client receiver dispatches to the public entry point with its args
+    vim.env.SSHDEV_REMOTE = nil
+    _G.SSHDEV_CONTROL_CHANNEL = nil
+    local orig_stop = Session.stop
+    local got = nil
+    Session.stop = function(opts)
+      got = opts
+    end
+    Session._remote_command('SshDevStop', { dest = 'me@host', force = true })
+    Session.stop = orig_stop
+    ok(got ~= nil, 'the receiver invokes the public entry point')
+    eq(got and got.dest, 'me@host', 'arguments survive the RPC')
+    eq(got and got.force, true, 'flags survive the RPC')
+
+    -- 6. only whitelisted names are executed
+    local orig_sync = Session.sync
+    local synced = false
+    Session.sync = function()
+      synced = true
+    end
+    Session._remote_command('SshDevConnect', {})
+    Session.sync = orig_sync
+    eq(synced, false, 'a non-client command is never dispatched')
+
+    -- 7. and the receiver never runs inside the remote server itself
+    vim.env.SSHDEV_REMOTE = '1'
+    local orig_status = Session.status
+    local statused = false
+    Session.status = function()
+      statused = true
+    end
+    Session._remote_command('SshDevStatus', {})
+    Session.status = orig_status
+    eq(statused, false, 'the remote receiver refuses to execute locally')
+
+    -- 8. a throwing runner is reported, not propagated
+    vim.env.SSHDEV_REMOTE = nil
+    local orig_err = Util.report_error
+    local reported = nil
+    Util.report_error = function(e)
+      reported = tostring(e)
+    end
+    local orig_install = Session.install
+    Session.install = function()
+      error('install exploded')
+    end
+    local ok_call = pcall(Session._remote_command, 'SshDevInstall', {})
+    Session.install = orig_install
+    Util.report_error = orig_err
+    ok(ok_call, 'a failing forwarded command does not escape the RPC handler')
+    ok(reported and reported:find('install exploded', 1, true) ~= nil, 'the failure is reported')
+  end)
+
+  _G.SSHDEV_CONTROL_CHANNEL = nil
+  vim.env.SSHDEV_REMOTE = saved_remote
+  vim.notify = orig_notify
+  if not okr then
+    error(err, 0)
+  end
+end)
+
 ----------------------------------------------------------- bootstrap
 
 T.describe('bootstrap.asset_name', function()

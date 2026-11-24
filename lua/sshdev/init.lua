@@ -108,11 +108,14 @@ function M.env(opts)
 end
 
 ---Stop the remote server (saves session.vim) and the local tunnel.
+---Typed inside the ATTACHED remote session, the command is forwarded to
+---the client and runs there (the remote has no local session to stop).
 function M.stop()
   session().stop()
 end
 
----Show the session status.
+---Show the session status. Also forwarded to the client when typed in
+---the attached remote session (the state it reports lives on the client).
 function M.status()
   session().status()
 end

@@ -586,9 +586,60 @@ already-running LSPs keep their old environment.
 Current use: when `:SshDevForward` runs inside an attached session, the
 remote pushes the forward.txt save back to the client, which replaces the
 forwards bound on its own machine and reports the outcome into the remote
-UI (see [port-forwarding.md](port-forwarding.md) §7). The channel is
-best-effort: when unavailable the feature degrades to `:detach`
-guidance.
+UI (see [port-forwarding.md](port-forwarding.md) §7). Client-owned
+commands do the same: `:SshDevStop`, `:SshDevStatus`, `:SshDevSync`,
+`:SshDevInstall` and `:SshDevProfiles` are forwarded to the client, which
+owns the tunnel, the profiles and the remote server process; its
+notifications are mirrored into the attached UI through the same channel
+(§ 8.4.1). The channel is best-effort: when unavailable the feature
+degrades to `:detach` guidance.
+
+#### 8.4.1 Client-owned commands (`:SshDevStop` & co.)
+
+Typing `:SshDevStop` in the attached remote session must not run in the
+remote server: there is no `state.info` there, so the old behavior was a
+confusing "no active sshdev session" message and nothing was stopped. The
+command layer forwards it instead:
+
+```text
+remote nvim (the UI the user drives)
+   │  :SshDevStop → SSHDEV_CONTROL_CHANNEL
+   │  rpcnotify(ch, 'nvim_exec_lua',
+   │            'require("sshdev.session")._remote_command(name, opts)')
+   ▼
+client nvim (headless behind the attached UI)
+   │  whitelist: SshDevStop / Status / Sync / Install / Profiles
+   │  runs the normal public entry point (same code as the local command)
+   │  Util message mirror → nvim_exec_lua on the remote UI
+   ▼
+remote UI: progress + result as `[sshdev]` notifications
+```
+
+- The whitelist is the security boundary: a remote cannot make the client
+  run arbitrary functions or commands.
+- `[dest] [workspace]` default to the **active session** for the commands
+  that accept them, so `:SshDevSync` inside the attached UI means "this
+  workspace".
+- `Util.set_message_mirror` is installed **right after a successful
+  `:connect`** (and re-installed by the keeper after a reconnect): while the
+  client is headless, its own `vim.notify()` has no surface, and worse, a
+  multi-line notification makes a headless nvim wait on an invisible
+  "Press ENTER" prompt — that blocks the main loop and silently freezes the
+  control channel. The mirror therefore **replaces** the local surface:
+  `Util.notify`/`report_error` skip the local call while it is installed, so
+  client-side messages (including failures) reach the remote UI without
+  stalling the client. `Util.status()` lines go through `nvim_echo`
+  (transient), everything else through `vim.notify`. A send failure is only
+  logged (the message is still in `:SshDevLog`); the local path is never used
+  as a fallback while attached.
+- The remote acknowledges the forward immediately. A successful
+  `:SshDevStop` closes the UI (the server is gone); if the stop fails the
+  remote server keeps running and a 20 s safety timer warns the user to
+  check the client's `:SshDevLog`.
+- Connection/picker commands (`:SshDevConnect`, `:SshDevAttach`,
+  `:SshDevHistory`) are **not** forwarded: a headless client cannot
+  re-attach its UI (`:connect` fails with "UI not attached to channel").
+  They report the `:detach` → run locally → `:SshDevAttach` workflow.
 
 ### 8.5 Local teardown (VimLeavePre)
 
@@ -696,6 +747,12 @@ Argument rules: `--nvim-profile=<key>` (also `--nvim-profile <key>` /
 auth mode for one invocation; at most two positional arguments
 (destination, workspace). History entries keep the **full destination
 including the ssh port**.
+
+`:SshDevStop`, `:SshDevStatus`, `:SshDevSync`, `:SshDevInstall` and
+`:SshDevProfiles` also work when typed **inside the attached remote
+session**: they are forwarded to the client and execute there (§ 8.4.1).
+`:SshDevConnect`, `:SshDevAttach` and the pickers cannot (a headless
+client cannot re-attach its UI) and tell the user to `:detach` first.
 
 Lua API (`require('sshdev')`): `connect` / `attach` / `pick` /
 `pick_history` / `profiles` / `install` / `sync` / `stop` / `status` /

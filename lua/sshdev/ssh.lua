@@ -158,11 +158,14 @@ end
 ---environment (env.txt) is exported there and the configured tool
 ---directories are prepended to PATH, so the remote command sees both (the
 ---job's env only affects the LOCAL ssh process).
+---opts.detach makes the ssh child survive this nvim exiting -- used by the
+---server stop, whose whole point is to run while the UI client is already
+---being torn down.
 ---Returns the await() result: { code, stdout, stderr, timed_out }.
 ---@param cfg table
 ---@param parsed table
 ---@param script string
----@param opts table|nil { timeout (s), label }
+---@param opts table|nil { timeout (s), label, detach }
 ---@return table
 function M.run_script(cfg, parsed, script, opts)
   opts = opts or {}
@@ -178,6 +181,7 @@ function M.run_script(cfg, parsed, script, opts)
     env = proc_env(cfg, parsed),
     timeout = opts.timeout and opts.timeout * 1000 or nil,
     label = opts.label,
+    detach = opts.detach,
   })
   if Auth.is_auth_failure(res) then
     Auth.forget(parsed)

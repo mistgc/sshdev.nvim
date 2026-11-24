@@ -140,6 +140,12 @@ With telescope (optional — enables the fuzzy pickers):
 On the remote session `:q` behaves normally: the server quits and saves
 `session.vim`. Reconnect with `:SshDevConnect` and the session is restored.
 
+`:SshDevStop`, `:SshDevStatus`, `:SshDevSync`, `:SshDevInstall` and
+`:SshDevProfiles` also work **inside the attached remote session**: they are
+forwarded to the client over the RPC control channel and run there, with the
+result shown in the attached UI (see
+[Client-owned commands](#client-owned-commands-in-the-attached-session)).
+
 ### Reusing an nvim profile
 
 The default `nvim_profile = 'auto'` derives the key from
@@ -566,6 +572,43 @@ which keeps your local nvim alive (useful when you want the local session
 back after quitting the remote one).
 
 Note: `:connect` was added in **Nvim 0.12**; 0.11 only has `:detach`.
+
+### Client-owned commands in the attached session
+
+Once the UI is attached, commands run in the **remote** nvim. That is fine for
+editing, but some commands can only work on the client — it owns the ssh
+tunnel, the reconnect proxy, the user forwards, the profiles and the remote
+server process. Typing `:SshDevStop` used to run in the remote server, find no
+local session and do nothing.
+
+The client now announces an RPC control channel at attach time
+(`SSHDEV_CONTROL_CHANNEL` on the remote). These commands are forwarded over it
+and executed on the client, with their progress and result mirrored back into
+the attached UI:
+
+| command | runs on the client as |
+| --- | --- |
+| `:SshDevStop` | stop the remote server (saves `session.vim`) + tunnel/forwards |
+| `:SshDevStatus` | the client's session/tunnel/profile/server report |
+| `:SshDevSync` | re-upload config + reinstall plugins |
+| `:SshDevInstall` | bootstrap the profiles (no server) |
+| `:SshDevProfiles` | list the nvim profiles of this client host |
+
+Without arguments the target-based commands use the **active session**, so
+`:SshDevSync` in the attached UI means "this workspace". The remote
+acknowledges the forward immediately and the output follows over the channel.
+
+Connection and picker commands still belong to the client's own UI:
+`:SshDevConnect`, `:SshDevAttach` and `:SshDevHistory` cannot re-attach a UI
+from the headless client, so they tell you to `:detach` (the server keeps
+running), run them in the local nvim, then `:SshDevAttach`. Without the control
+channel (an older plugin on either side) the forwarded commands report the same
+`:detach` workflow instead of running in the wrong place.
+
+`:SshDevForward` and `:SshDevEnv` keep their own remote-side editors: the files
+live on the server, and their saves are applied client-side (see
+[port-forwarding.md](docs/port-forwarding.md) and
+[environment.md](docs/environment.md)).
 
 ### Surviving network drops: the local reconnect proxy
 

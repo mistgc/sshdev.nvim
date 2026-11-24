@@ -551,11 +551,52 @@ function M.open_log()
   vim.cmd('normal! G')
 end
 
+---Optional sink that mirrors user-facing messages into ANOTHER UI.
+---
+---The reconnect/`:connect` attach makes THIS nvim headless: its own
+---`vim.notify()` output has no surface while the UI shows the remote
+---server -- worse, a multi-line notification makes a headless nvim wait on
+---an invisible "Press ENTER" prompt and FREEZES the RPC control channel. A
+---forwarded client-side command (|:SshDevStop| typed inside the attached
+---session) runs here, so its progress and result travel back over the
+---control channel instead. `fn(text, level, transient)` receives the final
+---text (the "[sshdev] " prefix is already applied) and returns true when
+---the message was handed to the other UI; `transient` marks status lines
+---that should not enter the remote message history. While a UI is attached
+---to THIS nvim the mirror is bypassed and messages surface locally.
+---@param fn function|nil
+function M.set_message_mirror(fn)
+  M._message_mirror = fn
+end
+
+---Hand a message to the mirror, if any.
+---@return boolean handled true = do NOT call the local (headless) surface
+local function mirror(text, level, transient)
+  local fn = M._message_mirror
+  if not fn then
+    return false
+  end
+  -- The mirror exists for a HEADLESS server. A UI attached to THIS nvim
+  -- means its own surface is back (e.g. an external GUI detached from the
+  -- remote), so the ordinary local path must win again.
+  local uis_ok, uis = pcall(vim.api.nvim_list_uis)
+  if uis_ok and #uis > 0 then
+    return false
+  end
+  pcall(fn, text, level, transient)
+  return true
+end
+
 ---User-facing notification with the [sshdev] prefix.
 ---Schedules itself when called from a fast event context.
 function M.notify(msg, level)
+  local text = '[sshdev] ' .. msg
+  local lvl = level or vim.log.levels.INFO
   local function show()
-    vim.notify('[sshdev] ' .. msg, level or vim.log.levels.INFO)
+    if mirror(text, lvl, false) then
+      return
+    end
+    vim.notify(text, level)
   end
   if vim.in_fast_event() then
     vim.schedule(show)
@@ -571,6 +612,9 @@ end
 ---the UI in a terminal. Details still land in the :SshDevLog buffer.
 function M.status(msg)
   local function show()
+    if mirror('[sshdev] ' .. msg, vim.log.levels.INFO, true) then
+      return
+    end
     pcall(vim.api.nvim_echo, { { '[sshdev] ' .. msg, 'None' } }, false, {})
   end
   if vim.in_fast_event() then
@@ -585,6 +629,9 @@ function M.report_error(err)
   local msg = tostring(err)
   M.log('error: %s', msg)
   vim.schedule(function()
+    if mirror('[sshdev] ' .. msg, vim.log.levels.ERROR, false) then
+      return
+    end
     vim.notify('[sshdev] ' .. msg, vim.log.levels.ERROR)
   end)
 end

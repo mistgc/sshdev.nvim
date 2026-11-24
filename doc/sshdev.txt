@@ -88,22 +88,28 @@ COMMANDS						*sshdev-commands*
 *:SshDevInstall*
 :SshDevInstall [{dest}] [{workspace}] [--nvim-profile={key}]
 	Bootstrap only: binary, nvim profile (config + plugins), workspace
-	profile. Does not start or attach.
+	profile. Does not start or attach. Forwarded to the client inside
+	the attached session (|sshdev-attached-commands|).
 
 *:SshDevSync*
 :SshDevSync [{dest}] [{workspace}]	Re-upload the config and reinstall the
 	plugins into this config's own nvim profile. Use :SshDevConnect! to
 	restart the server with the new config. Never overwrites an
 	explicitly reused profile (the auto profile is synced instead).
+	Forwarded to the client inside the attached session
+	(|sshdev-attached-commands|).
 
 *:SshDevStop*
 :SshDevStop			Stop the remote server (SIGTERM, so it saves
-	session.vim) and kill the local tunnel.
+	session.vim) and kill the local tunnel. Typed inside the ATTACHED
+	session it is forwarded to the client and runs there (see
+	|sshdev-attached-commands|).
 
 *:SshDevStatus*
 :SshDevStatus			Report local host, auto nvim profile key,
 	active session, workspace/nvim profiles, tunnel, remote server and
-	saved-session state.
+	saved-session state. Forwarded to the client inside the attached
+	session (|sshdev-attached-commands|).
 
 *:SshDevHistory* *sshdev-history*
 :SshDevHistory [{dest}]		Open the workspace picker: scans the remote
@@ -114,7 +120,8 @@ COMMANDS						*sshdev-commands*
 *:SshDevProfiles*
 :SshDevProfiles [{dest}]	List the reusable nvim profiles that exist on
 	the remote for this client host: key, nvim version, ready state and
-	the number of workspace profiles referencing them.
+	the number of workspace profiles referencing them. Forwarded to the
+	client inside the attached session (|sshdev-attached-commands|).
 
 *:SshDevForward*
 :SshDevForward [{dest}] [{workspace}]
@@ -426,6 +433,55 @@ server immediately, then the client is notified over
 (which later ssh/scp commands use). When the control channel is
 unavailable the file still applies to the server; the client mirror
 refreshes on the next :SshDevConnect.
+
+==============================================================================
+CLIENT-OWNED COMMANDS IN THE ATTACHED SESSION		*sshdev-attached-commands*
+
+With the default "connect" attach, commands typed after
+|:SshDevConnect| run in the REMOTE nvim. Some commands, however, only
+make sense on the CLIENT: it owns the ssh tunnel, the reconnect proxy,
+the user forwards and the remote server process, and its filesystem has
+the config, the history and the profiles. Running them in the remote
+server used to fail or, worse, report "no active session" and do
+nothing.
+
+The client announces an RPC control channel at attach time
+(`SSHDEV_CONTROL_CHANNEL` on the remote; see remote-connection.md in
+docs/ section 8.4). These commands are now forwarded over
+it; the client executes them and mirrors their progress and result back
+into the attached UI:
+
+	:SshDevStop	stop the remote server (saves session.vim) + tunnel
+	:SshDevStatus	the client's session/tunnel/profile/server report
+	:SshDevSync	re-upload the config + reinstall plugins
+	:SshDevInstall	bootstrap the profiles (no server)
+	:SshDevProfiles	list the nvim profiles of this client host
+
+The remote acknowledges immediately (":SshDevStop was forwarded to the
+client ..."), then the command's output follows over the channel. While
+the UI is attached the client is headless: its user-facing messages
+(progress, results and errors) are injected into the attached UI over the
+control channel instead of its own invisible message area, so nothing is
+lost and the client does not stall on a message prompt.
+
+The commands not listed above still belong to the client's own UI and say
+so: :SshDevConnect, :SshDevAttach and the pickers cannot attach or
+re-attach a UI from the headless client -- use :detach (the server
+keeps running), run them locally, then :SshDevAttach.
+
+Without arguments, :SshDevSync / :SshDevInstall / :SshDevProfiles
+target the ACTIVE session (its destination and workspace) instead of
+requiring [dest] [workspace].
+
+The forwarding is best effort: without the control channel (an older
+plugin on either side, or a lost announce) the command reports the
+:detach workflow instead of running in the wrong place. A successful
+:SshDevStop closes this UI (there is nothing left to attach to); if it
+fails, the server keeps running and warns here after a few seconds --
+check the client's :SshDevLog and retry. :SshDevForward and
+:SshDevEnv have their own remote-side editors and do not need
+forwarding (see |sshdev-forwards-attached| and
+|sshdev-env-attached|).
 
 ==============================================================================
 REMOTE TOOL PATH					*sshdev-path*

@@ -491,7 +491,14 @@ function M.stop_server(cfg, parsed, ctx)
     WS_PROFILE = Util.shsafe(ctx.workspace_profile, 'workspace profile dir'),
     FIND_RUNNING = Scripts.find_running,
   })
-  local res = Ssh.run_script(cfg, parsed, script, { timeout = cfg.timeouts.ssh, label = 'ssh' })
+  -- Detached on purpose: the UI client may already be going away (a stop
+  -- typed inside the attached session tears the tunnel/proxy down first), so
+  -- the SIGTERM must still be delivered after this nvim exits.
+  local res = Ssh.run_script(cfg, parsed, script, {
+    timeout = cfg.timeouts.ssh,
+    label = 'ssh',
+    detach = true,
+  })
   if res.code ~= 0 then
     return nil, ('stopping the remote server failed (exit %s)'):format(res.code)
   end
