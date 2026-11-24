@@ -352,6 +352,16 @@ printf 'SSHDEV:PREPARED=1\n'
 ---Swap the uploaded config into place and install the plugins ONCE per nvim
 ---profile. A mkdir lock serializes concurrent bootstraps of the same profile;
 ---waiters poll for `.ready` and steal the lock only when its owner is dead.
+---
+---Two integrity guards protect against a silently broken profile:
+---  * leftover plugin trees from an interrupted install (network drop, a
+---    killed nvim, a timeout) are removed before installing: vim.pack only
+---    looks at "directory exists + lockfile entry", so a half-checked-out
+---    worktree would otherwise be reused forever and break `require()` at
+---    startup;
+---  * `nvim --headless` exits 0 even when `init.lua` raises (it only prints
+---    E5113), so a config that cannot load would still be marked `.ready`.
+---    The install output is scanned and a config error fails the install.
 M.commit = [==[
 set -eu
 ROOT='{{ROOT}}'
@@ -454,12 +464,43 @@ export NVIM_APPNAME=nvim-config
 export SSHDEV_REMOTE=1
 export SSHDEV_NVIM_PROFILE="$NP"
 
+# A failed or interrupted previous install can leave a plugin directory whose
+# worktree is incomplete (e.g. `git clone --no-checkout` that never got its
+# `checkout`, or files removed by a killed process). vim.pack decides
+# "installed" from the directory + the lockfile entry only, so it would reuse
+# that tree forever and the plugin's `require()` fails at every startup.
+# Drop incomplete trees here; the lockfile installs them again below.
+PACK_OPT="$NP/xdg/share/nvim-config/site/pack/core/opt"
+if [ -d "$PACK_OPT" ] && command -v git >/dev/null 2>&1; then
+  for d in "$PACK_OPT"/*; do
+    [ -d "$d" ] || continue
+    if [ ! -d "$d/.git" ] \
+      || git -C "$d" status --porcelain --untracked-files=no 2>/dev/null | grep -q '^ D'; then
+      rm -rf "$d"
+    fi
+  done
+fi
+
+INSTALL_LOG="$NP/.install.log"
 INSTALL_RC=0
-"$BIN" --headless{{INSTALL_CMDS}} +qa! || INSTALL_RC=$?
+"$BIN" --headless{{INSTALL_CMDS}} +qa! >"$INSTALL_LOG" 2>&1 || INSTALL_RC=$?
 if [ "$INSTALL_RC" -ne 0 ]; then
   printf 'SSHDEV:ERROR=install\n'
+  tail -n 40 "$INSTALL_LOG" 2>/dev/null || true
   exit 1
 fi
+
+# Neovim exits 0 when init.lua raises an error -- the message is only printed.
+# Marking `.ready` in that state pins a profile whose config cannot load (a
+# missing/broken plugin, e.g. nvim-treesitter) and every later connect starts
+# a broken server. Treat any config-load error as a failed install.
+CONFIG_ERROR_RE='^Error in .*(init\.vim|init\.lua):|^Error detected while processing|E5113: Lua chunk:'
+if grep -qE "$CONFIG_ERROR_RE" "$INSTALL_LOG"; then
+  printf 'SSHDEV:ERROR=config\n'
+  tail -n 40 "$INSTALL_LOG" 2>/dev/null || true
+  exit 1
+fi
+
 printf '%s\n' "$HASH" > "$NP/.ready"
 printf 'SSHDEV:NP=installed\n'
 RELEASE_LOCK

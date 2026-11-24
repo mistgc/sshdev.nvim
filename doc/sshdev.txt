@@ -836,6 +836,16 @@ the remote server log is `<workspace-profile>/server.log`.
   `vim.env.CC`/`vim.env.CXX` unconditionally, but the uploaded config
   runs on the remote host. Guard those assignments with
   `vim.fn.has('win32') == 1` (or check `vim.env.SSHDEV_REMOTE == '1'`).
+- The remote UI shows `E5113` / "module 'nvim-treesitter' not found" (or
+  any other plugin module) at startup -- the nvim profile was left
+  incomplete by a failed/interrupted install and older versions still
+  marked it ready (`nvim --headless` exits 0 even when init.lua raises).
+  Repair it with :SshDevConnect!: the install now removes half-checked-out
+  plugin trees and refuses to mark a profile ready when the config does
+  not load. If it persists, remove the profile's plugin tree on the remote
+  (`rm -rf <nvim-profile>/xdg/share/nvim-config/site/pack`) and run
+  :SshDevConnect! again. The full install output is kept at
+  `<nvim-profile>/.install.log`.
 - Old layout after upgrading -- see |sshdev-layout| (binaries and saved
   sessions are migrated; plugins are reinstalled once).
 

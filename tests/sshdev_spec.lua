@@ -841,6 +841,19 @@ T.describe('remote scripts: commit (lock, staging swap, install)', function()
   ok(commit:find('> "$NP/.ready"', 1, true) ~= nil, 'ready marker written last')
   ok(commit:find('FORCE', 1, true) ~= nil, 'force reinstall supported')
   ok(commit:find("'" .. layout.config_hash .. "'", 1, true) ~= nil, 'config hash embedded')
+  -- interrupted installs leave half-checked-out plugin trees: remove them
+  ok(commit:find('PACK_OPT="$NP/xdg/share/nvim-config/site/pack/core/opt"', 1, true) ~= nil,
+    'plugin tree path known')
+  ok(commit:find('git -C "$d" status --porcelain --untracked-files=no', 1, true) ~= nil,
+    'incomplete worktrees are detected')
+  ok(commit:find('rm -rf "$d"', 1, true) ~= nil, 'incomplete plugin trees are removed')
+  -- nvim exits 0 on init.lua errors: the install must inspect its output
+  ok(commit:find('INSTALL_LOG="$NP/.install.log"', 1, true) ~= nil, 'install output captured')
+  ok(commit:find('>"$INSTALL_LOG" 2>&1', 1, true) ~= nil, 'install output redirected')
+  ok(commit:find('SSHDEV:ERROR=config', 1, true) ~= nil, 'config errors fail the install')
+  ok(commit:find('E5113: Lua chunk:', 1, true) ~= nil, 'E5113 is detected')
+  ok(commit:find("CONFIG_ERROR_RE='^Error in", 1, true) ~= nil, 'config-load errors are scanned')
+  ok(commit:find('grep -qE "$CONFIG_ERROR_RE"', 1, true) ~= nil, 'the install log is grepped')
 end)
 
 T.describe('remote scripts: start (server + per-workspace session)', function()

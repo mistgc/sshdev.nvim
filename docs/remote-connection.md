@@ -215,6 +215,21 @@ Step by step (source: `lua/sshdev/session.lua`):
    written last). Two concurrent connects to new workspaces serialize on
    the mkdir lock (waiting up to `timeouts.lock`), so plugins are never
    installed twice in parallel.
+
+   The install verifies more than the exit code, because `nvim --headless`
+   **exits 0 even when `init.lua` raises** (`E5113` is only printed):
+
+   - the nvim output is captured in `<nvim-profile>/.install.log`; a
+     config-load error (`Error in …init.lua`, `E5113`, a Vimscript error)
+     fails the install instead of pinning a broken profile as `.ready`;
+   - plugin trees left behind by an interrupted install (network drop,
+     killed nvim, timeout) are removed first. `vim.pack` treats "directory
+     exists + lockfile entry" as installed, so a half-checked-out worktree
+     would otherwise be reused forever and every later startup would fail
+     exactly like `module 'nvim-treesitter' not found`.
+
+   A failed install is reported with the log tail; `:SshDevConnect!`
+   re-runs it and repairs the trees.
 9. **start_server** — tries `rbase`, `rbase+1`, `rbase+2` in order
    (§7.2); only when all three fail is an error reported.
 10. **run_attach** — with `reconnect = true` and the `connect` strategy,

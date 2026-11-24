@@ -872,6 +872,17 @@ file is a plain `KEY=VALUE` list, not a shell script — quote/expansion
 semantics would differ between the local mirror, the remote export and
 `vim.env`.
 
+**Why does the remote session show `E5113` / `module 'nvim-treesitter' not
+found` at startup?**
+That profile was left behind by a failed or interrupted plugin install and
+an older version still marked it ready — `nvim --headless` exits 0 even when
+`init.lua` raises. Run `:SshDevConnect!`: the install now drops
+half-checked-out plugin trees and refuses to write `.ready` when the config
+does not load. If the error persists, delete the profile's plugin tree on
+the remote (`rm -rf <nvim-profile>/xdg/share/nvim-config/site/pack`) and
+reconnect; the full install log is `<nvim-profile>/.install.log`, also
+echoed by `:SshDevLog` when an install fails.
+
 **How do I get rid of old nvim profiles?**
 Each config edit creates a new `nvim-profiles/--…--` directory (the old one is
 kept for reuse/pinning). `:SshDevProfiles` lists them; delete unused ones with

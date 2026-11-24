@@ -391,10 +391,22 @@ function M.commit_profile(cfg, parsed, layout, opts)
     return nil, ('the uploaded config for nvim profile %s is missing; '
       .. 'run :SshDevConnect! to retry the upload'):format(layout.nvim_profile_key)
   end
-  if kv.ERROR == 'install' or res.code ~= 0 then
-    return nil, ('installing plugins into nvim profile %s failed (exit %s) — see :SshDevLog'):format(
+  if kv.ERROR == 'config' then
+    -- nvim exits 0 when init.lua raises; the install script scans its output
+    -- and refuses to mark the profile ready. Show the real reason here.
+    return nil, ('your config failed to load on the remote, so nvim profile %s '
+      .. 'was NOT marked ready (an incomplete plugin tree is repaired on the '
+      .. 'next attempt). Install log:\n%s'):format(
       layout.nvim_profile_key,
-      res.code
+      Util.tail(res.stdout, 30)
+    )
+  end
+  if kv.ERROR == 'install' or res.code ~= 0 then
+    return nil, ('installing plugins into nvim profile %s failed (exit %s). '
+      .. 'Install log:\n%s'):format(
+      layout.nvim_profile_key,
+      res.code,
+      Util.tail(res.stdout, 25)
     )
   end
   if kv.NP == 'installed' then
